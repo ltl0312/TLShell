@@ -100,6 +100,62 @@ pub fn window_dpi(hwnd: windows::Win32::Foundation::HWND) -> u32 {
     }
 }
 
+/// 包含指定屏幕坐标的显示器的工作区（不含任务栏）。
+pub fn work_area_for_point(x: i32, y: i32) -> Option<Rect> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    let point = POINT { x, y };
+    // SAFETY: 只读查询，point 是栈上值。
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    if monitor.0.is_null() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: info 已填好 cbSize，monitor 有效。
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let work = info.rcWork;
+    Some(Rect::new(
+        work.left,
+        work.top,
+        work.right - work.left,
+        work.bottom - work.top,
+    ))
+}
+
+/// 主显示器工作区。多屏或查询失败时给一个保守的 1920x1080 兜底。
+pub fn primary_work_area() -> Rect {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    let point = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+    // SAFETY: 只读查询。
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY) };
+    if !monitor.0.is_null() {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: info 已填好 cbSize，monitor 有效。
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            let work = info.rcWork;
+            return Rect::new(
+                work.left,
+                work.top,
+                work.right - work.left,
+                work.bottom - work.top,
+            );
+        }
+    }
+    Rect::new(0, 0, 1920, 1080)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,8 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
     HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MSG,
     SW_HIDE, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
-    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE,
+    WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
 };
 
 use crate::config::Config;
@@ -598,6 +598,29 @@ impl App {
         LRESULT(HTCLIENT as isize)
     }
 
+    /// 把当前几何写进 `state.json`。
+    ///
+    /// 只在 `WM_EXITSIZEMOVE` 调用（计划书 §5.3）：拖动过程中每个像素都写盘毫无必要，
+    /// 而且会把磁盘刷爆。写失败只告警——记不住位置不影响这次使用。
+    fn persist_state(&self, hwnd: HWND) {
+        let Ok(rect) = window::window_rect(hwnd) else {
+            diag::warn("保存位置失败：读不到窗口矩形");
+            return;
+        };
+        let window_dpi = dpi::window_dpi(hwnd);
+        let monitor =
+            dpi::work_area_for_point(rect.x, rect.y).unwrap_or_else(dpi::primary_work_area);
+        let state = crate::config::state::State::new(rect, window_dpi, monitor);
+        if let Err(err) = crate::config::state::save(&crate::config::state::state_path(), &state) {
+            diag::warn(&format!("保存位置失败: {err:#}"));
+        } else {
+            diag::debug(&format!(
+                "已保存位置: {}x{}@{},{} dpi={window_dpi}",
+                rect.w, rect.h, rect.x, rect.y
+            ));
+        }
+    }
+
     /// 限制最小尺寸，避免缩到没法用。
     fn apply_min_size(&self, hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let window_dpi = dpi::window_dpi(hwnd);
@@ -644,6 +667,10 @@ impl App {
             }
             WM_ERASEBKGND => Some(window::ERASE_HANDLED),
             WM_NCHITTEST => Some(self.hit_test(hwnd, lparam)),
+            WM_EXITSIZEMOVE => {
+                self.persist_state(hwnd);
+                None
+            }
             WM_GETMINMAXINFO => Some(self.apply_min_size(hwnd, lparam)),
             WM_SIZE => {
                 if let Err(err) = self.apply_size(hwnd) {
@@ -825,17 +852,21 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRES
 }
 
 /// 启动消息循环，返回进程退出码。
-pub fn run(config: Config) -> Result<i32> {
+pub fn run(config: Config, rect: Option<dpi::Rect>) -> Result<i32> {
     let hinstance = window::module_handle()?;
     window::register_class(hinstance, wndproc)?;
 
+    // 恢复矩形可能来自上次的 state.json，也可能是配置里的默认值；
+    // 调用方已经把完全落在屏幕外的矩形钳回来了。
     let spec = WindowSpec {
-        rect: dpi::Rect::new(
-            config.window.x,
-            config.window.y,
-            config.window.width,
-            config.window.height,
-        ),
+        rect: rect.unwrap_or_else(|| {
+            dpi::Rect::new(
+                config.window.x,
+                config.window.y,
+                config.window.width,
+                config.window.height,
+            )
+        }),
     };
 
     // 泄漏而不是回收：`App` 必须比窗口活得更久，且窗口过程可能在任意时刻回访它。

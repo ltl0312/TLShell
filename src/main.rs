@@ -17,6 +17,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 use config::Config;
+use win::dpi;
+
+/// 窗口最小尺寸（逻辑像素），与 `app` 里的 `WM_GETMINMAXINFO` 保持一致。
+const MIN_WIDTH: i32 = 480;
+const MIN_HEIGHT: i32 = 240;
 
 /// 命令行选项。刻意保持极小：这不是一个需要子命令的工具。
 #[derive(Debug, Default)]
@@ -25,6 +30,8 @@ struct Options {
     report: Option<PathBuf>,
     quit: bool,
     config_path: Option<PathBuf>,
+    /// 忽略 `state.json`，回到配置里的默认位置。
+    reset_position: bool,
 }
 
 fn main() -> ExitCode {
@@ -68,16 +75,17 @@ fn show_fatal(message: &str) {
 }
 
 fn run_normal(options: &Options) -> Result<u8> {
-    let mut config = match load_config(options) {
-        Ok(config) => config,
-        Err(err) => {
-            diag::warn(&format!("配置加载失败，使用默认值: {err:#}"));
-            Config::default()
-        }
-    };
-    config.sanitize();
+    let loaded = load_config(options);
+    for warning in &loaded.warnings {
+        diag::warn(warning);
+    }
+    if loaded.created {
+        diag::info(&format!("已生成默认配置: {}", loaded.path.display()));
+    }
+    let config = loaded.config;
 
-    let code = app::run(config)?;
+    let rect = resolve_rect(&config, options.reset_position);
+    let code = app::run(config, Some(rect))?;
     Ok(code.clamp(0, 255) as u8)
 }
 
@@ -88,8 +96,39 @@ fn run_quit_request() -> Result<u8> {
 }
 
 /// M0 阶段只有默认值；`config.toml` 的加载与校验在 M3 接入。
-fn load_config(_options: &Options) -> Result<Config> {
-    Ok(Config::default())
+fn load_config(options: &Options) -> config::Loaded {
+    config::load(options.config_path.as_deref())
+}
+
+/// 决定窗口初始矩形：优先上次落盘的位置，否则用配置里的默认值；
+/// 无论来源，最终都要钳进显示器工作区，否则断电拔掉副屏之后窗口会跑到看不见的地方。
+fn resolve_rect(config: &Config, reset_position: bool) -> dpi::Rect {
+    let mut rect = dpi::Rect::new(
+        config.window.x,
+        config.window.y,
+        config.window.width,
+        config.window.height,
+    );
+
+    if !reset_position {
+        let path = config::state::state_path();
+        if let Some(state) = config::state::load(&path) {
+            rect = state.window.to_rect();
+            diag::info(&format!(
+                "恢复上次位置: {}x{}@{},{}",
+                rect.w, rect.h, rect.x, rect.y
+            ));
+        }
+    }
+
+    let work = dpi::work_area_for_point(rect.x, rect.y).unwrap_or_else(dpi::primary_work_area);
+    let clamped = dpi::clamp_rect(rect, work, MIN_WIDTH, MIN_HEIGHT);
+    if clamped != rect {
+        diag::warn(&format!(
+            "窗口矩形 {rect:?} 超出显示器工作区 {work:?}，已钳回 {clamped:?}"
+        ));
+    }
+    clamped
 }
 
 fn run_selftest(options: &Options) -> Result<u8> {
@@ -117,6 +156,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
         match arg.as_str() {
             "--selftest" => options.selftest = true,
             "--quit" => options.quit = true,
+            "--reset-position" => options.reset_position = true,
             "--report" => {
                 index += 1;
                 let value = pending

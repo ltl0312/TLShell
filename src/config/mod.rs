@@ -1,9 +1,172 @@
-//! 配置模型与默认值。
+//! 配置模型、默认值与文件加载。
 //!
-//! 本模块只负责**数据形状**与默认值；文件加载、校验与钳制在后续里程碑接入。
 //! 任何字段缺失都靠 `#[serde(default)]` 退化为默认值，不允许因为一个字段写错就启动失败。
+//! 加载失败一律退回默认值并记告警——终端打不开比配置写错严重得多。
+//!
+//! 配置文件放在 `%APPDATA%\TLShell\config.toml`（计划书 §6.2）。不用 Roaming 之外
+//! 的位置是为了让用户能跟着漫游配置走；日志则相反，落在 `%LOCALAPPDATA%`（见 `diag`）。
 
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+pub mod state;
+
+/// 配置目录 `%APPDATA%\TLShell`。取不到 `APPDATA` 时退回当前目录，至少不会崩。
+pub fn config_dir() -> PathBuf {
+    match std::env::var_os("APPDATA") {
+        Some(appdata) if !appdata.is_empty() => PathBuf::from(appdata).join("TLShell"),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// 配置文件路径 `%APPDATA%\TLShell\config.toml`。
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// 一次加载的结果：配置本身、实际使用的路径、以及所有告警。
+pub struct Loaded {
+    pub config: Config,
+    pub path: PathBuf,
+    pub warnings: Vec<String>,
+    /// 文件本来不存在、这次顺手写了一份默认配置。
+    pub created: bool,
+}
+
+impl Loaded {
+    fn from_defaults(path: PathBuf) -> Self {
+        Self {
+            config: Config::default(),
+            path,
+            warnings: Vec::new(),
+            created: false,
+        }
+    }
+}
+
+/// 加载配置。
+///
+/// - `explicit` 为 `Some` 时用它，否则用 `config_path()`。
+/// - 文件不存在 → 写一份带注释的默认配置，返回默认值。
+/// - 文件损坏 → 返回默认值 + 告警，**不覆盖**用户的文件（他可能只是想手改）。
+pub fn load(explicit: Option<&Path>) -> Loaded {
+    let path = explicit.map(Path::to_path_buf).unwrap_or_else(config_path);
+    let mut loaded = Loaded::from_defaults(path.clone());
+
+    if !path.exists() {
+        if let Err(err) = write_default(&path) {
+            loaded.warnings.push(format!("默认配置写入失败: {err:#}"));
+        } else {
+            loaded.created = true;
+        }
+        return loaded;
+    }
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            loaded
+                .warnings
+                .push(format!("读取 {} 失败: {err}", path.display()));
+            return loaded;
+        }
+    };
+
+    match toml::from_str::<Config>(&text) {
+        Ok(mut config) => {
+            config.sanitize();
+            loaded.config = config;
+        }
+        Err(err) => {
+            loaded.warnings.push(format!(
+                "{} 解析失败，本次使用默认配置: {err}",
+                path.display()
+            ));
+        }
+    }
+    loaded
+}
+
+/// 写一份默认配置，字段顺序与注释对齐计划书 §6.1。
+pub fn write_default(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+    let defaults = Config::default();
+    let body = format!(
+        r#"# TLShell 配置
+# 修改后重启生效。删掉本文件会重新生成一份默认值。
+
+[shell]
+# 裸文件名只会在白名单目录里查找，不走 PATH，也不看当前目录。
+# 白名单：%SystemRoot%\System32、System32\WindowsPowerShell\v1.0、
+#         %ProgramFiles%\PowerShell\7（含 7-preview）
+program = "{program}"
+args = []
+
+[window]
+width = {width}
+height = {height}
+x = {x}
+y = {y}
+# 0.10 到 1.00。低于 0.70 时正文对比度可能不足。
+opacity = {opacity}
+padding = {padding}
+border_radius = {border_radius}
+
+[font]
+family = "{family}"
+size = {size}
+line_height = {line_height}
+# 留空表示自动挑选 CJK 回退字体。
+fallback_family = ""
+
+[colors]
+background = "{background}"
+foreground = "{foreground}"
+cursor = "{cursor}"
+selection = "{selection}"
+focus_ring = "{focus_ring}"
+
+[keys]
+quit = "{quit}"
+hide = "{hide}"
+
+[security]
+# OSC 52：允许程序写系统剪贴板。默认关闭。
+osc52 = {osc52}
+# 允许 shell.program 指向白名单之外的路径。默认关闭。
+allow_custom_shell = {allow_custom_shell}
+# 粘贴时剥离控制字符并对多行内容二次确认。默认开启。
+paste_guard = {paste_guard}
+"#,
+        program = defaults.shell.program,
+        width = defaults.window.width,
+        height = defaults.window.height,
+        x = defaults.window.x,
+        y = defaults.window.y,
+        opacity = defaults.window.opacity,
+        padding = defaults.window.padding,
+        border_radius = defaults.window.border_radius,
+        family = defaults.font.family,
+        size = defaults.font.size,
+        line_height = defaults.font.line_height,
+        background = defaults.colors.background,
+        foreground = defaults.colors.foreground,
+        cursor = defaults.colors.cursor,
+        selection = defaults.colors.selection,
+        focus_ring = defaults.colors.focus_ring,
+        quit = defaults.keys.quit,
+        hide = defaults.keys.hide,
+        osc52 = defaults.security.osc52,
+        allow_custom_shell = defaults.security.allow_custom_shell,
+        paste_guard = defaults.security.paste_guard,
+    );
+    std::fs::write(path, body).with_context(|| format!("写入默认配置失败: {}", path.display()))
+}
 
 /// 透明度低于该值时正文对比度会掉到不可读区间，仅告警不拒绝。
 #[allow(dead_code)] // M4 接入玻璃外观时用于启动告警

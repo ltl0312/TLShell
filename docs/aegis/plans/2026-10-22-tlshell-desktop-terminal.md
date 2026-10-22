@@ -39,6 +39,12 @@ TLShell 是一个 **Rust 写的、把自己挂进 Windows 桌面层（WorkerW）
 - ❌ 跨平台（只做 Windows 10 1809+ / 11）
 - ❌ 托盘图标、设置 GUI（配置走 `config.toml` 手改 + 热重载）
 
+**安全基线（强制）**：信任边界划分、进程与权限模型、剪贴板/粘贴策略、最小权限清单见
+[安全架构评审](../design/2026-10-22-tlshell-security-architecture.md)。
+其中 S-01–S-17 是设计约束（不是建议），M0–M5 的追加验收动作见该文档 §8。
+五条不可协商项：① 不自动提权，提权态必须可见；② 子进程绑定 Job Object；③ 零网络；
+④ 剪贴板写入默认拒绝；⑤ 窗口消息不携带命令。
+
 ---
 
 ## 2. 需求就绪检查
@@ -76,7 +82,7 @@ TLShell 是一个 **Rust 写的、把自己挂进 Windows 桌面层（WorkerW）
 | **Alacritty** | Apache-2.0 | `alacritty_terminal` crate（0.26.0）：`Term` 网格模型、ANSI/VT 解析状态机、滚动缓冲、选区、`EventListener` 回调 | 它的 winit 窗口层、OpenGL 渲染器、glyph cache、配置系统 | 只当「网格 + 状态机」用，自己把 `Term` 画出来 |
 | **Alacritty** | Apache-2.0 | `alacritty/src/input.rs` 的**键盘编码逻辑**（移植源码，不是依赖） | 其中与 winit 耦合的事件匹配代码 | 移植为 `src/term/input.rs`，输入源换成 `WM_KEYDOWN` / `WM_CHAR`；**保留原版权头与 Apache-2.0 声明** |
 | **WezTerm** | MIT | `portable-pty` crate（0.9.0）：`PtyPair` / `PtySystem`、Windows ConPTY 封装 | 它的 mux、渲染、Lua 配置 | 起 PTY、拿读写句柄，其余不管 |
-| **rust-windowing** | MIT/Apache-2.0 | `softbuffer`（0.4.8）：裸窗口句柄 → 像素缓冲提交 | — | 帧绘制出口 |
+| **rust-windowing** | MIT/Apache-2.0 | ~~`softbuffer`（0.4.8）~~ **出局**：不支持 layered window，无法做圆角 + 逐像素 alpha | — | 改为自建 32-bit DIB + `UpdateLayeredWindow`（约 150 行，见 UI 规范 §2.6） |
 | **fontdue** | MIT/Apache-2.0 | 字形解析 + 光栅化为 alpha 位图 | 它的排版能力（我们只需要等宽网格） | 自己算格位、自己 blit |
 | **microsoft/windows-rs** | MIT/Apache-2.0 | 全部 Win32 绑定（`windows` 0.62.2） | — | 窗口、WorkerW、分层、热键 |
 
@@ -98,7 +104,6 @@ TLShell 是一个 **Rust 写的、把自己挂进 Windows 桌面层（WorkerW）
 | `alacritty_terminal` | 0.26.0 | 2.17M |
 | `portable-pty` | 0.9.0 | 22.7M |
 | `windows` | 0.62.2 | 372M |
-| `softbuffer` | 0.4.8 | 29.3M |
 | `fontdue` | 0.9.5 | 10.9M |
 | `serde` / `serde_json` | 1.0.229 / 1.0.154 | — |
 | `anyhow` | 1.0.104 | — |
@@ -191,6 +196,10 @@ D:\Code\Rust\TLShell\
 3. **位置只在 `WM_EXITSIZEMOVE` 时落盘**，拖动过程中不写文件（避免高频 IO）。
 4. **PTY 读线程与 UI 线程通过 channel 通信**，不共享可变状态。
 5. **单实例**：命名 Mutex 保证；第二次启动只发送「显示/聚焦」信号。
+6. **提权态必须可见**：启动自检 `TokenElevation`；high IL 时描边**常驻**改色 + overlay `ADMIN` 标注，
+   且不随失焦消失（借此与焦点态区分）。永不自动提权，manifest 恒为 `asInvoker` + `uiAccess="false"`。
+7. **子进程绑定生命周期**：shell 放入 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），
+   TLShell 崩溃不得留下无窗口的 shell 进程。
 
 ---
 
@@ -208,7 +217,7 @@ width         = 900
 height        = 420
 x             = 40            # 首次启动位置；之后以 state.json 为准
 y             = 40
-opacity       = 0.88          # 0.0–1.0
+opacity       = 0.65          # 0.30–1.0，越界钳制；<0.72 提亮、<0.45 停留提亮（见 UI 规范 §2.4–2.5）
 padding       = 10
 border_radius = 8
 
@@ -238,7 +247,10 @@ quit = "Ctrl+Alt+Q"
 
 保存 `dpi` 与 `bounds` 是为了：换显示器或改缩放后，按比例还原而不是跑到屏幕外。
 
-**路径**：`%APPDATA%\TLShell\`（config 与 state 同目录）。
+**路径**：`%LOCALAPPDATA%\TLShell\`（config 与 state 同目录）。
+用 `LOCALAPPDATA` 而非 `APPDATA`：`config.toml` 是执行策略文件（`program` + `args` + 热键），
+不该随漫游配置文件同步到文件服务器；`state.json` 是机器相关几何，漫游反而冲突。
+若只存在 `%APPDATA%\TLShell\config.toml`，不读取，仅在日志中提示用户迁移。
 
 ---
 
@@ -250,10 +262,11 @@ quit = "Ctrl+Alt+Q"
 | **点击抢焦点** | 点击终端会激活它 | 这是能打字的必要条件；不影响其他程序运行 |
 | **多显示器** | Win10+ 每个显示器一个 WorkerW | MVP 只挂主屏，多屏在 M5 评估 |
 | **Explorer 重启** | 窗口会脱离 WorkerW | M5 监听 `TaskbarCreated` 消息重挂 |
-| **管理员程序** | 目标程序提权时 PTY 仍可工作，挂载不受影响 | 无影响（挂载的是自己的窗口） |
+| **在终端里跑管理员程序** | ConPTY 子进程不能自行提权：需管理员的程序会触发 UAC 并在新控制台运行，**不在本 PTY 内提权** | 用户需另开管理员终端；本项不是"无影响"，是"不成立" |
+| **TLShell 自身提权** | `asInvoker` 继承父令牌：从管理员 shell 启动则本进程为 high IL，**其后起的每个 shell 都是管理员** | 启动自检 `TokenElevation` + 常驻提权角标（安全评审 S-01）；不得自动提权，`uiAccess` 恒 `false` |
 | **全屏游戏** | 桌面被覆盖，终端不可见 | 符合预期 |
 | **透明** | 只有 alpha，无模糊 | 见 §1.2 不做项 |
-| **退出方式** | 无托盘、无关闭按钮 | 全局热键 `Ctrl+Alt+Q`；或 `TLShell.exe --quit` |
+| **退出方式** | 无托盘、**无关闭按钮与任何关闭 UI 元素** | 全局热键 `Ctrl+Alt+Q`（有活动子进程时二次确认）；注册失败降级为**焦点内热键**（`WM_KEYDOWN` 捕获并消费该组合）+ 底部一次性警告行（UI 规范 §4.5）；或 `TLShell.exe --quit`（优雅关闭 PTY 后退出） |
 
 ---
 
@@ -326,7 +339,7 @@ quit = "Ctrl+Alt+Q"
 | 目的 | 满足 R4 |
 | 最小改动 | `WS_EX_LAYERED` + `SetLayeredWindowAttributes(alpha)`；背景色/前景色/光标色从配置读取；自绘圆角边框与内边距 |
 | 兼容影响 | 无 |
-| 验收 | ① `opacity = 0.88` 时壁纸透出、文字清晰；② 改 `0.5` 明显更透；③ 改 `background` 颜色立即反映（热重载）；④ 圆角与边框在浅色/深色壁纸下都不糊 |
+| 验收 | ① `opacity = 0.88` 时壁纸透出、文字清晰；② 改 `0.5` 明显更透；③ 硬下限 `0.30`（写 `0.1` 被钳制并告警）、`<0.72` 自动前景提亮、`<0.45` 停留 600ms 提亮+移开 400ms 回落（UI 规范 §2.4–2.5）；④ 改 `background` 颜色立即反映（热重载）；⑤ 圆角与边框在浅色/深色壁纸下都不糊 |
 | 命令 | 手动冒烟 |
 
 ### M5 — 打磨与稳定性（约 3–5 天）
@@ -335,7 +348,7 @@ quit = "Ctrl+Alt+Q"
 |---|---|
 | 文件 | 全部模块 |
 | 目的 | 从「能跑」到「能天天用」 |
-| 最小改动 | 滚轮滚动 scrollback；鼠标选中 + `Ctrl+C` 复制；IME 中文输入；Explorer 重启后 `TaskbarCreated` 重挂；多显示器选择；大输出时的重绘节流（16ms）；单实例 |
+| 最小改动 | 滚轮滚动 scrollback；鼠标选中 + `Ctrl+Shift+C` 复制（`Ctrl+C` 语义见安全评审 §6.1）；控制条 `Clear`/`New`（Clear 不发字节、New 双击确认 + armed 复位）；剪贴板四件（拒绝非文本 / 净化控制符 / 多行二次确认 / bracketed paste，见安全评审 §5.5-2）；IME 中文输入；Explorer 重启后 `TaskbarCreated` 重挂（去抖 ≥2s）；多显示器选择；大输出时的重绘节流（16ms）；单实例 |
 | 兼容影响 | IME 会改变输入路径，需回归 M1 的键盘验收 |
 | 验收 | ① 滚轮可回看历史；② 选中文本 `Ctrl+C` 能粘到别处；③ **中文输入法能打出中文（PS 5.1 与 pwsh 各测一次）**；④ `taskkill /f /im explorer.exe && start explorer` 后终端自动回到桌面层；⑤ `cat` 大文件不卡死；⑥ 第二次启动不产生第二个窗口 |
 | 命令 | 手动冒烟 + `cargo clippy -- -D warnings` |
