@@ -18,19 +18,20 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
 | D 行为负例 | `--quit` 真退出、`--restart-unelevated` 非提权退 0、未知参数拒绝、坏配置仍启动、缺 `USERPROFILE` 拒绝启动、白/黑壁纸对比度 | 6 |
 | E 真实输入（可选，`-RealInput`） | `--probe-real`：真实点击命中自己、拿到焦点、拖选出选区、按键写进 PTY、**敲出整词 `ipconfig`**、归还前台 | 6 |
 
-合计 **42 项/轮**（含 E 层时）。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
+合计 **43 项/轮**（含 E 层时）。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
+E 层（`-RealInput`）用真实 `SendInput`，每个发送函数发送前都确认前台仍是自己；
 结束时把前台还给原窗口，因此可以在用户正常工作时不打断地跑。
 
 ## 结果
 
 | 轮次 | 参数组合（`opacity` / `padding` / `radius` / `font`） | 结论 | 报告 |
 |---|---|---|---|
-| 1 | 0.82 / 8 / 6 / 13 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
-| 2 | 0.84 / 10 / 8 / 14 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
-| 3 | 0.86 / 12 / 10 / 15 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
-| 4 | 0.88 / 14 / 12 / 16 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
-| 5 | 0.90 / 16 / 14 / 17 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
-| 6 | 0.92 / 18 / 16 / 18 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
+| 1 | 0.82 / 8 / 6 / 13 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
+| 2 | 0.84 / 10 / 8 / 14 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
+| 3 | 0.86 / 12 / 10 / 15 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
+| 4 | 0.88 / 14 / 12 / 16 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
+| 5 | 0.90 / 16 / 14 / 17 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
+| 6 | 0.92 / 18 / 16 / 18 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
 
 每轮用 `%TEMP%\aegis-round-N\config.toml` 换一组参数，所以六轮不只是「同一套用例跑六次」：
 它同时验证参数变化（透明度、内边距、圆角、字号）不会破坏任何链路。
@@ -39,7 +40,7 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
 窗口尺寸并顶掉 `config` 的 `width/height`，不隔离的话 C 层像素判据会读到上一轮的几何
 （本轮就踩到 `1024x730`）。
 
-`cargo test` 161 passed，clippy 零告警，fmt 干净。
+`cargo test` 167 passed，clippy 零告警，fmt 干净。
 
 ## 关键断言（不是「跑完没报错」）
 
@@ -65,3 +66,14 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
   常规回归不跑它（会动真实鼠标键盘），只在需要时手动执行。
 - **提权重启的提权分支**、**IME 真机上屏**、**中间灰壁纸**、**录屏类动态过渡**未验证，
   逐条列在 [M7 证据](../vis/M7/index.md#未验证项不掩饰)。
+
+## 本轮新增用例
+
+- **E · 输入法上屏去重**：进程内连续两次调用真实提交函数
+  （先 `ImeSource::Composition` 再 `ImeSource::Char`，同一段文本），断言
+  「第一次写入 3 字节、第二次写入 0 字节」。真实输入法上屏无法自动化，这条是能做到的
+  最强验证：判据走的就是产品代码里的 `commit_ime_text`，不是另写一份规则。
+- **C · 启动即可见可点** 改为按模式判定：桌面层模式（`sink_when_unfocused = true`）
+  下不要求拿到前台，只要求「可见且已沉底」；普通模式仍要求 `启动取焦点 foreground=true`。
+- **E · 前台归还** 改为显式等待（`Wait-ForLogLine`，5 秒）：归还发生在结算之后一拍，
+  读冻结切片会偶发漏掉（第 4 轮真踩到过，属于执行器竞态，不是产品缺陷）。

@@ -130,3 +130,41 @@ arm `suppress_char_until`（50ms），紧随其后的 `WM_CHAR` 被丢弃。
 但「真人用物理键盘」这一步仍无法在自动化里替代；`VK_PACKET` 的具体来源（虚拟化/输入法）
 在不同机器上可能不同，所以判据放在「字节是否正确」，而不是「走了哪条分支」。
 
+## 输入法「打一遍、回车又一遍」的修复
+
+现象：微软拼音候选条组字时终端里已经出现拼音字母，按空格/回车选词后又出现一遍，
+最终得到两遍。两处独立原因：
+
+1. **组字期间终端自己也在翻译按键**。`WM_KEYDOWN` 里我们用 `ToUnicodeEx` 自行翻译，
+   组字状态下它返回的是拼音字母（`a`、`d`、`s`…），于是候选窗里一组字、终端里一组字。
+   修法：`src/win/ime.rs::is_composing` 用 `ImmGetCompositionStringW(GCS_COMPSTR)` 判断
+   「正在组字」，此时把键盘整个让给输入法（仅非 Ctrl/Alt 时）。
+2. **上屏结果走了两条消息**。`WM_IME_COMPOSITION`(`GCS_RESULTSTR`) 与 `WM_IME_CHAR`
+   携带同一段文本，两条都写就是「回车又输一遍」。修法：两条路都汇到
+   `App::commit_ime_text`，按「内容相同 + 来源不同 + 400 ms 内」判重，命中即丢弃；
+   判据是纯函数 `ime_is_duplicate`，单测覆盖同源重复（连打两个「中」不能被吞）。
+
+证据：
+
+- 单测 5 条（`same_text_from_the_other_path_is_a_duplicate`、
+  `the_same_path_may_repeat_the_same_text`、`different_text_is_never_a_duplicate`、
+  `duplicates_expire_with_the_window`、`the_first_commit_is_never_a_duplicate`）。
+- 真机自检 `IME 去重自检: 第一次写入=3 字节 第二次写入=0 字节 去重=true`，
+  `run-all.ps1 -RealInput` 每轮断言这一行。
+
+**手动验证步骤**（真实输入法必须人工确认，自动化只能覆盖到上面这条）：
+
+1. `cargo build --release` 后运行 `target\release\tlshell.exe`。
+2. 切到微软拼音，输入 `nihao`，**组字期间终端里不应出现 `nihao`**（只有候选条有）。
+3. 按空格/回车选词，终端里应恰好出现一次「你好」。
+4. 查看 `%LOCALAPPDATA%\TLShell\logs\tlshell.log`，应看到一行
+   `输入法上屏重复（同内容、另一条消息），已丢弃` —— 这说明第二条消息确实被吞掉了；
+   若没有这行，说明本机输入法只发其中一条，也没有重复可去。
+
+## 桌面层默认值
+
+用户反馈「感觉不是绑定桌面的，可以在任意窗口层级」，因此
+`window.sink_when_unfocused` 默认改为 `true`：失焦即沉到 `HWND_BOTTOM`，与壁纸同层，
+普通窗口永远在它上面。代价写在 README「已知限制 4」：最大化窗口会盖住它，需要
+`Ctrl+Alt+T` 或设置面板把这一项关掉。自检期间（`--probe-real`）临时不沉底，
+否则探针拿不到前台、合成事件会落到别人窗口上（本轮修的就是这个）。

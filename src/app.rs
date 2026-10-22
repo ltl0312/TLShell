@@ -16,9 +16,9 @@ use alacritty_terminal::term::{Osc52, TermMode};
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT};
-use windows::Win32::UI::Input::Ime::GCS_RESULTSTR;
 use windows::Win32::UI::Input::Ime::{
     ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
+    GCS_RESULTSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU, VK_SHIFT,
@@ -61,6 +61,32 @@ pub const HOTKEY_ID_HIDE: i32 = 2;
 /// 这时鼠标点不到它，只剩一个纯键盘的入口。
 pub const HOTKEY_ID_RAISE: i32 = 3;
 
+/// 判定「这一次上屏是不是上一次的重复」：内容相同、来源不同、时间相邻。
+///
+/// 抽成纯函数是为了能直接测：真实输入法上屏没法自动化，但这条规则可以。
+fn ime_is_duplicate(
+    last: Option<&(String, Instant, ImeSource)>,
+    text: &str,
+    source: ImeSource,
+    now: Instant,
+) -> bool {
+    match last {
+        Some((prev, at, prev_source)) => {
+            prev == text && *prev_source != source && now.duration_since(*at) < IME_DUP_WINDOW
+        }
+        None => false,
+    }
+}
+
+/// 输入法上屏消息来自哪条路。同一次上屏两条路都会来，只有内容比对才知道是不是重复。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImeSource {
+    /// `WM_IME_COMPOSITION` + `GCS_RESULTSTR`（组字型输入法的主路径）。
+    Composition,
+    /// `WM_IME_CHAR`（逐码元，非 BMP 字符由高低代理项两发）。
+    Char,
+}
+
 /// 唯一的定时器 id：同时驱动 PTY 泵与光标闪烁。
 const TIMER_TICK: usize = 1;
 /// 定时器周期。16ms ≈ 60Hz，是“内容驱动重绘”的节流下限。
@@ -84,6 +110,9 @@ const VK_PACKET: u32 = 0xe5;
 /// `TranslateMessage` 在同一轮消息泵里就把 `WM_CHAR` 排进队列，实际间隔在毫秒级；
 /// 50ms 足够覆盖，又短到不会误伤用户的下一次真实输入。
 const SUPPRESS_CHAR_WINDOW: Duration = Duration::from_millis(50);
+/// 同一次输入法上屏可能先后走 `GCS_RESULTSTR` 和 `WM_IME_CHAR` 两条路。
+/// 谁先谁后没有保证，所以去重按「内容相同 + 来源不同 + 时间相邻」判定。
+const IME_DUP_WINDOW: Duration = Duration::from_millis(400);
 /// `--dump-frame` 落盘前至少先画这么多帧：等 shell 首屏输出已经进网格，
 /// 否则截到的是空白帧，看不出文字锐度（V-02）。
 const DUMP_DELAY: Duration = Duration::from_millis(1500);
@@ -124,8 +153,12 @@ pub struct App {
     /// 上一版用一个裸 bool，方向键/F 键根本不产生 `WM_CHAR`，标志就一直挂着，
     /// 把用户之后敲的第一个真实字符吃掉（代码审查 B4）。
     suppress_char_until: Option<Instant>,
+    /// 最近一次输入法上屏写了什么、什么时候、走哪条路（只用于去重，不写日志）。
+    last_ime_result: Option<(String, Instant, ImeSource)>,
     /// 输入法上屏时等待配对的 UTF-16 高代理项（非 BMP 字符由两条 `WM_IME_CHAR` 组成）。
     ime_high_surrogate: Option<u16>,
+    /// 这个输入法是否用 `WM_IME_COMPOSITION` 通知上屏。
+    ///
     /// 底部提示条（粘贴确认、配置告警），到点自动消失。
     overlay: Option<(String, Instant)>,
     /// 自检开始前的前台窗口，结束时还回去（不把用户踢出正在用的窗口）。
@@ -238,6 +271,7 @@ impl App {
             last_render: Instant::now(),
             suppress_char_until: None,
             ime_high_surrogate: None,
+            last_ime_result: None,
             overlay: None,
             status: None,
             pending_paste: None,
@@ -494,6 +528,19 @@ impl App {
                 self.real_probe = false;
                 self.probe_previous_foreground = 0;
                 self.probe = None;
+                // 输入法去重的端到端自检：同一段文本先后从两条消息路径进来，
+                // 第二次必须被吞掉。这条走的是真实 `commit_ime_text`，
+                // 不是另写一份判据；真实输入法上屏无法自动化，这一条是能做到的最强验证。
+                let before = self.probe_writes;
+                self.commit_ime_text("好", ImeSource::Composition);
+                let first = self.probe_writes - before;
+                let before = self.probe_writes;
+                self.commit_ime_text("好", ImeSource::Char);
+                let second = self.probe_writes - before;
+                diag::info(&format!(
+                    "IME 去重自检: 第一次写入={first} 字节 第二次写入={second} 字节 去重={}",
+                    second == 0
+                ));
             }
             probe::Phase::Report => {
                 let state = dock::focus_state(self.hwnd);
@@ -890,6 +937,28 @@ impl App {
     ///
     /// 上一版直接把每个码元当 `char` 转换，代理项转换必然失败，于是整字丢失
     /// （代码审查 B5）。这里做一对缓冲。
+    /// 输入法上屏的唯一出口：两条消息路径都从这里写，顺便去重。
+    ///
+    /// 微软拼音上屏时 `WM_IME_COMPOSITION`(`GCS_RESULTSTR`) 与 `WM_IME_CHAR`
+    /// 会各来一条、内容相同，两条都写就是「打一遍、回车又一遍」。
+    /// 只看「见过 COMPOSITION 就永远忽略 IME_CHAR」把正确性押在先后顺序上，
+    /// 而顺序并没有保证：先到的那条已经写进 PTY 了。这里改为比对内容。
+    fn commit_ime_text(&mut self, text: &str, source: ImeSource) {
+        let now = Instant::now();
+        if ime_is_duplicate(self.last_ime_result.as_ref(), text, source, now) {
+            diag::debug("输入法上屏重复（同内容、另一条消息），已丢弃");
+            return;
+        }
+        if self.real_probe {
+            self.real_events.2 += 1;
+        }
+        self.write_to_pty(text.as_bytes());
+        // 只记字节数，不记内容：日志里出现用户输入等于内置键盘记录器（F-01）。
+        diag::debug(&format!("输入法上屏 {} 字节（内容不记录）", text.len()));
+        self.last_ime_result = Some((text.to_owned(), now, source));
+        self.dirty = true;
+    }
+
     fn commit_ime_unit(&mut self, unit: u16) {
         const HIGH_START: u16 = 0xD800;
         const HIGH_END: u16 = 0xDBFF;
@@ -908,7 +977,7 @@ impl App {
                         + (((high as u32) - HIGH_START as u32) << 10)
                         + ((unit as u32) - LOW_START as u32);
                     if let Some(ch) = char::from_u32(code) {
-                        self.send_char(ch);
+                        self.commit_ime_text(&ch.to_string(), ImeSource::Char);
                     }
                 }
                 None => diag::warn("输入法上屏出现孤立低代理项，已丢弃"),
@@ -918,7 +987,7 @@ impl App {
         // 普通码元：清掉可能残留的半对代理项，避免串到下一个字符。
         self.ime_high_surrogate = None;
         if let Some(ch) = char::from_u32(unit as u32) {
-            self.send_char(ch);
+            self.commit_ime_text(&ch.to_string(), ImeSource::Char);
         }
     }
 
@@ -1157,6 +1226,13 @@ impl App {
             self.handle_settings_key(vk);
             return;
         }
+        // 输入法开着的时候键盘归输入法：拼音字母必须由它组成候选词，
+        // 我们一边写 PTY 一边让它组词就是「输入一遍、回车再输一遍」。
+        // 关掉输入法（英文模式）才轮到自己翻译，这条判据与系统行为一致。
+        if !mods.ctrl && !mods.alt && crate::win::ime::is_composing(self.hwnd) {
+            return;
+        }
+
         // 打开设置：Ctrl+, 或 F2（不需要记组合键）。
         const VK_COMMA: u32 = 0xbc;
         const VK_F2: u32 = 0x71;
@@ -1317,7 +1393,9 @@ impl App {
     /// 需要在窗口显示前再补一次提示条，否则只落日志、用户看不见（UI 规范 G5）。
     /// 是否启用「失焦沉底」。
     fn sinks(&self) -> bool {
-        self.config.window.sink_when_unfocused
+        // 自检期间不沉底：探针要把窗口压到最上层才能把合成事件送到自己身上，
+        // 一沉底，后面每一步的 `SetForegroundWindow` 都会被前台锁挡掉。
+        self.config.window.sink_when_unfocused && !self.real_probe
     }
 
     /// 按配置沉底；关闭时什么都不做（窗口留在普通 z-order 里）。
@@ -1454,11 +1532,7 @@ impl App {
         self.watch_config();
         // 可见性看门狗：被 Win+D 之类的操作收走后自己找回来（S-01b）。
         if !self.headless {
-            if let Some(reason) = self
-                .watchdog
-                .poll(self.hwnd)
-                .filter(|_| self.config.window.sink_when_unfocused)
-            {
+            if let Some(reason) = self.watchdog.poll(self.hwnd).filter(|_| self.sinks()) {
                 diag::warn(&reason);
                 self.set_overlay(reason);
             }
@@ -1868,22 +1942,21 @@ impl App {
                 //
                 // 只记录**字节数**，不记录内容：日志里出现用户输入的字符等于
                 // 内置键盘记录器（安全评审 F-01）。
-                if lparam.0 as u32 & GCS_RESULTSTR.0 != 0 {
+                let flags = lparam.0 as u32;
+                if flags & GCS_RESULTSTR.0 != 0 {
                     if let Some(text) = ime::result_string(hwnd) {
                         if !text.is_empty() {
-                            let bytes = text.len();
-                            self.write_to_pty(text.as_bytes());
-                            if self.real_probe {
-                                self.real_events.2 += 1;
-                            }
-                            diag::debug(&format!("输入法上屏 {bytes} 字节（内容不记录）"));
-                            self.dirty = true;
+                            self.commit_ime_text(&text, ImeSource::Composition);
                         }
                     }
                 }
                 Some(LRESULT(0))
             }
             WM_IME_CHAR => {
+                // 组字型输入法（微软拼音实测如此）上屏时会同时发
+                // `WM_IME_COMPOSITION`(`GCS_RESULTSTR`) 与这条 `WM_IME_CHAR`。
+                // 去重放在 `commit_ime_text` 里按「内容 + 来源 + 时间」判，
+                // 不依赖两条消息谁先到。
                 // 输入法上屏。**不记录字符内容**：那等于给自己装了一个键盘记录器
                 // （安全评审 F-01）。
                 //
@@ -2253,7 +2326,12 @@ pub fn run(
 
     diag::info(&format!("启动完成: {}", window::describe(hwnd)));
     // 遮挡自检：外部探针（受限桌面）看不到真实窗口，因此「点得到吗」只能由本进程回答。
-    diag::info(&format!("命中自检: {}", dock::hit_report(hwnd)));
+    diag::info(&format!(
+        "命中自检: {} 可见={} 沉底={}",
+        dock::hit_report(hwnd),
+        dock::is_visible(hwnd),
+        app.sinks()
+    ));
     Ok(message_loop())
 }
 
@@ -2371,5 +2449,88 @@ mod tests {
         let mut config = Config::default();
         config.security.osc52 = true;
         assert!(matches!(osc52_mode(&config), Osc52::OnlyCopy));
+    }
+}
+
+#[cfg(test)]
+mod ime_dedupe_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn last(text: &str, source: ImeSource, at: Instant) -> (String, Instant, ImeSource) {
+        (text.to_owned(), at, source)
+    }
+
+    #[test]
+    fn same_text_from_the_other_path_is_a_duplicate() {
+        let at = Instant::now();
+        let previous = last("你好", ImeSource::Composition, at);
+        assert!(ime_is_duplicate(
+            Some(&previous),
+            "你好",
+            ImeSource::Char,
+            at + Duration::from_millis(5)
+        ));
+        let previous = last("hello", ImeSource::Char, at);
+        assert!(ime_is_duplicate(
+            Some(&previous),
+            "hello",
+            ImeSource::Composition,
+            at + Duration::from_millis(300)
+        ));
+    }
+
+    #[test]
+    fn the_same_path_may_repeat_the_same_text() {
+        // 连打两个一样的字（比如「中中」）走的是同一条路，不能被当重复吞掉。
+        let at = Instant::now();
+        let previous = last("中", ImeSource::Composition, at);
+        assert!(!ime_is_duplicate(
+            Some(&previous),
+            "中",
+            ImeSource::Composition,
+            at + Duration::from_millis(1)
+        ));
+        let previous = last("a", ImeSource::Char, at);
+        assert!(!ime_is_duplicate(
+            Some(&previous),
+            "a",
+            ImeSource::Char,
+            at + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn different_text_is_never_a_duplicate() {
+        let at = Instant::now();
+        let previous = last("你好", ImeSource::Composition, at);
+        assert!(!ime_is_duplicate(
+            Some(&previous),
+            "你们",
+            ImeSource::Char,
+            at + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn duplicates_expire_with_the_window() {
+        let at = Instant::now();
+        let previous = last("ok", ImeSource::Composition, at);
+        assert!(!ime_is_duplicate(
+            Some(&previous),
+            "ok",
+            ImeSource::Char,
+            at + IME_DUP_WINDOW
+        ));
+    }
+
+    #[test]
+    fn the_first_commit_is_never_a_duplicate() {
+        assert!(!ime_is_duplicate(
+            None,
+            "你好",
+            ImeSource::Composition,
+            Instant::now()
+        ));
     }
 }

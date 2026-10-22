@@ -78,15 +78,15 @@ cargo build --release
    亚克力/Mica 背景特效。整窗 alpha 是「文字和背景一起变透」，`opacity` 调到 `0.70` 以下
    正文对比度会跌破 4.5:1（`OPACITY_WARN_BELOW` 会在启动时告警，但不阻止）。
    要做「背景透、文字不透」需要把文字层单独合成，属于另一条渲染路线。
-4. **沉底是可选项，默认关闭**：窗口是**顶层窗口**（`parent = NULL`）。Win32 键盘焦点属于线程
+4. **默认沉在桌面层**：窗口是**顶层窗口**（`parent = NULL`）。Win32 键盘焦点属于线程
    输入队列，`SetFocus` 只能设给同队列的窗口；把窗口 `SetParent` 到 `WorkerW` 会变成 explorer
-   队列的子窗口，键盘**永远到不了**它 —— 所以「挂进桌面」这条路已删除。
-   `window.sink_when_unfocused = true` 时才在失焦后沉到 `HWND_BOTTOM`：那时窗口会跑到所有
-   最大化窗口下面（点不到，只能靠 `Ctrl+Alt+T` 叫回来）；默认 `false` 就是普通 z-order，
-   点得到、打得进。设置面板最后一项就是这个开关，改完立即生效。
+   队列的子窗口，键盘**永远到不了**它 —— 所以「挂进桌面」这条路已经删除。
+   `window.sink_when_unfocused` 默认 `true`：失焦后沉到 `HWND_BOTTOM`，像壁纸一样待在桌面层，
+   任何普通窗口都在它上面。代价是最大化的窗口会盖住它，要用 `Ctrl+Alt+T` 叫回来。
+   想要「点得到、打得进」的普通终端行为，把这一项改成 `false`（设置面板最后一项，改完立即生效）。
    启动时会先 `HWND_TOPMOST` 抬到最前并取焦点 —— 后台进程抢前台会被 Windows 的前台锁
    拒绝（实测 `focus_set=true` 而 `foreground=false`），这时保持 topmost 让窗口看得见、
-   点得到，等用户点一下触发 `WM_ACTIVATE` 后再自动退回普通层。
+   点得到，等用户点一下触发 `WM_ACTIVATE` 后再按配置沉底。
 5. **无托盘、无关闭按钮**：退出靠全局热键 `Ctrl+Alt+Q`，或 `tlshell.exe --quit`。
 6. **只用一个显示器**：位置按启动时所在显示器的工作区钳制，不跟随跨屏拖动重新协商。
 7. **全屏游戏会遮住它**：符合预期。
@@ -95,9 +95,13 @@ cargo build --release
    可见性看门狗每 2 秒检查一次（3 次冷却 3 秒的恢复上限），被持续抢占时只能靠点击唤回。
 10. **桌面图标会画在它上面**：图标层由 explorer 绘制，位置固定在最上层。
 11. **不支持拖放文件**：不注册 `WS_EX_ACCEPTFILES`，也不处理 `WM_DROPFILES`。
-12. **输入法只做定位与上屏**：`WM_IME_STARTCOMPOSITION` 时把候选窗口挪到光标位置，
-    `WM_IME_CHAR` 按 UTF-16 代理对拼成完整字符（含非 BMP）后写入 PTY；
-    候选框样式与行内预编辑显示交给系统 IME。
+12. **输入法只做定位与上屏**：`WM_IME_STARTCOMPOSITION` 时把候选窗口挪到光标位置；
+    组字期间（`ImmGetCompositionStringW(GCS_COMPSTR)` 非空）键盘完全交给输入法，终端不自己翻译；
+    上屏结果只写一次 —— 微软拼音会同时发 `WM_IME_COMPOSITION`(`GCS_RESULTSTR`) 与
+    `WM_IME_CHAR`，两条内容相同、先后不保证，因此按「内容 + 来源 + 400ms 窗口」去重
+    （命中时日志里有一行 `输入法上屏重复…已丢弃`，warn 级，默认可见）。
+    真实输入法的人机验证步骤见 `docs/aegis/evidence/vis/M7/index.md`。
+
 
 ## 安全边界
 

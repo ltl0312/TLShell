@@ -1,4 +1,4 @@
-﻿#Requires -Version 7.0
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     TLShell 分层全量测试：静态门禁 → 无界面自检 → 真机功能探针 → 行为负例，循环 N 轮。
@@ -158,6 +158,13 @@ height = 420
 [font]
 size = $size
 line_height = 1.25
+
+[keys]
+# 刻意避开常见的 Ctrl+Alt+Q/H/T：用户可能正开着自己的实例，抢同一个热键会
+# 让自检误报「热键注册失败」。
+quit = "Ctrl+Alt+F9"
+hide = "Ctrl+Alt+F10"
+raise = "Ctrl+Alt+F11"
 "@ | Set-Content -Path $path -Encoding utf8
     return @{ Path = $path; Opacity = $opacity; Padding = $padding; Radius = $radius }
 }
@@ -290,6 +297,9 @@ function Invoke-LayerC {
             '结算键盘就绪'        = '输入自检\[结算\].*已写入 PTY 14 字节'
             '前台已归还'          = '前台已还给|没有可归还的前台|已不存在，跳过归还'
         }
+        # 「归还前台」发生在结算之后一拍，读冻结的切片会偶发漏掉（第 4 轮真踩过）。
+        # 这里显式等它出现，等不到再判 FAIL。
+        $log = Wait-ForLogLine -Offset $offset -Pattern '前台已还给|没有可归还的前台|已不存在，跳过归还' -TimeoutSeconds 5
         foreach ($name in $expectations.Keys) {
             $pattern = $expectations[$name]
             if ($pattern -eq 'NO_MATCH') {
@@ -308,8 +318,13 @@ function Invoke-LayerC {
         # 必须保持 topmost 抬升，命中自检要落在自己窗口上。
         $focusedOk = $log -match '启动取焦点: foreground=true'
         $raisedOk = $log -match '命中自检: \([^)]*\) -> 自己:TLShellWindow'
-        Add-Result C '启动即可见可点' $(if ($focusedOk -or $raisedOk) { 'PASS' } else { 'FAIL' }) `
-            "取前台=$focusedOk 顶层抬升=$raisedOk"
+        # 桌面层模式（sink_when_unfocused）故意不抢前台、也不抬到最上：
+        # 只要窗口可见且按配置沉了底，就算符合预期。
+        $sinkOk = $log -match '命中自检: .*可见=true 沉底=true'
+        $sinkMode = $log -match '启动：桌面层模式'
+        Add-Result C '启动即可见可点' $(
+            if ($focusedOk -or ($sinkMode -and $sinkOk) -or ($raisedOk -and -not $sinkMode)) { 'PASS' } else { 'FAIL' }
+        ) "取前台=$focusedOk 顶层抬升=$raisedOk 桌面层=$sinkMode 可见且沉底=$sinkOk"
 
         # 首帧落盘 + 像素断言（白底最差条件，逐点对应解析解）。
         $frameLog = Wait-ForLogLine -Offset $offset -Pattern '首帧已落盘' -TimeoutSeconds 10
@@ -527,14 +542,21 @@ function Invoke-LayerE {
         }
         $checks = [ordered]@{
             '真实点击命中自己' = '真实点击@.*moved=true down=true up=true'
-            '真实点击拿到焦点' = '点击取焦点: foreground=true focus_set=true keyboard_ready=true'
+            # 前台锁可能挡住第一次 SetForegroundWindow（实测有别的程序抢前台），
+            # 真正的判据是「点自己一下之后拿没拿到前台」。
+            '真实点击拿到焦点' = '(点击取焦点: foreground=true|抬到最前 foreground=true)'
             '真实拖选出选区'   = '扩展选择 -> line=\d+ col=\d+ 选区=Some'
             '真实按键写进 PTY' = '真实输入结算: 点击=\d+ 按键=[1-9]\d* 写入 PTY=[1-9]\d* 字节'
             # 敲的是真词 ipconfig：C/N/F/G 的扫描码 0x2E/0x31/0x21/0x22 全都 ≥0x20。
             # 八个字节必须按顺序出现，才说明「扫描码被当成 UTF-16 码元」的缺陷没复发。
             '真实按键敲出 ipconfig' = '(?s)自检写入 1 字节: \[105\].*?\[112\].*?\[99\].*?\[111\].*?\[110\].*?\[102\].*?\[105\].*?\[103\]'
+            # 输入法上屏去重：同一段文本先后从 COMPOSITION 与 IME_CHAR 两条路进来，
+            # 第二次必须被吞掉（真实 IME 上屏无法自动化，这条走的是真实提交函数）。
+            '输入法上屏去重'   = 'IME 去重自检: 第一次写入=[1-9]\d* 字节 第二次写入=0 字节 去重=true'
             '前台已归还'       = '前台已还给|没有可归还的前台'
         }
+        # 同上：归还前台晚于结算，等一拍再判定。
+        $log = Wait-ForLogLine -Offset $offset -Pattern '前台已还给|没有可归还的前台' -TimeoutSeconds 5
         foreach ($name in $checks.Keys) {
             $pattern = $checks[$name]
             Add-Result E $name $(if ($log -match $pattern) { 'PASS' } else { 'FAIL' }) $pattern

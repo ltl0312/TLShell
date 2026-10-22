@@ -178,6 +178,77 @@ fn foreground_is(hwnd: HWND) -> bool {
 /// 抬起窗口到最前、抢到前台，并记录还原所需的状态。
 ///
 /// 返回 `None` 表示前台没拿到——此时**一个事件都没发**，调用方必须中止整个探针。
+/// 探针期间的守卫：前台必须是本窗口，否则一个事件都不发。
+///
+/// 真实桌面上别的程序会抢前台（实测有游戏窗口周期性来抢），一次没拿到就放弃
+/// 会让整轮自检白跑。这里允许再拿一次，拿不到仍然放弃 —— 守卫本身不放宽。
+fn ensure_foreground(hwnd: HWND, phase: Phase) -> bool {
+    if foreground_is(hwnd) {
+        return true;
+    }
+    let ok = force_foreground(hwnd) && foreground_is(hwnd);
+    note(phase, &format!("前台被抢走，重新取回={ok}"));
+    ok
+}
+
+/// 自检专用：用一次「附加输入队列」把前台强行拿过来，随即分离。
+///
+/// 这是 `SetForegroundWindow` 在前台锁下的唯一确定性破法。只允许在
+/// `--probe-real` 探针里调用：产品代码附加到别的线程输入队列，会让本进程的
+/// 键盘状态与那个线程绑在一起，等于把输入控制权交出去。
+fn force_foreground(hwnd: HWND) -> bool {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+
+    // SAFETY: 只读查询前台窗口，不改变任何状态。
+    // 先压到最上层：探针期间窗口通常在桌面层（最底），合成的鼠标事件会落到
+    // 盖在它上面的窗口上 —— 只拿前台而不改 z-order，点击就到不了自己身上。
+    // SAFETY: 只改本窗口的 z-order，不移动、不缩放、不激活。
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+
+    // SAFETY: 只读查询前台窗口，不改变任何状态。
+    let target = unsafe { GetForegroundWindow() };
+    if target.is_invalid() {
+        return false;
+    }
+    // SAFETY: 只读查询前台窗口所属线程。
+    let other = unsafe { GetWindowThreadProcessId(target, None) };
+    // SAFETY: GetCurrentThreadId 无参数、无副作用。
+    let mine = unsafe { GetCurrentThreadId() };
+    if other == 0 || other == mine {
+        return false;
+    }
+    // SAFETY: 附加的是本线程到前台线程的输入队列，成对分离。
+    let attached = unsafe { AttachThreadInput(mine, other, true) }.as_bool();
+    // SAFETY: 只作用于本进程拥有的窗口。
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+    }
+    if attached {
+        // SAFETY: 与上面的附加严格配对。
+        unsafe {
+            let _ = AttachThreadInput(mine, other, false);
+        }
+    }
+    crate::win::dock::raise_and_focus(hwnd).keyboard_ready()
+}
+
 pub fn begin_real(hwnd: HWND) -> Option<RealGuard> {
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -213,6 +284,13 @@ pub fn begin_real(hwnd: HWND) -> Option<RealGuard> {
         // 用户输入会授予前台权。点击前必须确认该坐标上的窗口就是自己，
         // 否则宁可不点 —— 上一轮抢用户鼠标的事故就是这么来的。
         ok = click_self(hwnd) && foreground_is(hwnd);
+    }
+    if !ok {
+        // 桌面层模式（默认）下本进程从不持有前台，上面两条都会被前台锁挡掉。
+        // 自检需要可复现的前台，于是这里借一次输入队列附加：
+        // 只在本探针里做，用完立刻分离；产品路径从不使用 AttachThreadInput
+        // （它会把本进程的键盘状态与被附加进程绑在一起）。
+        ok = force_foreground(hwnd) && foreground_is(hwnd);
     }
     note(
         Phase::RealRaise,
@@ -381,7 +459,7 @@ pub fn real_click(hwnd: HWND, _guard: &RealGuard) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSE_EVENT_FLAGS,
     };
-    if !foreground_is(hwnd) {
+    if !ensure_foreground(hwnd, Phase::RealClick) {
         note(Phase::RealClick, "守卫拦截：前台不是本窗口，未发送任何事件");
         return false;
     }
@@ -410,7 +488,7 @@ pub fn real_drag(hwnd: HWND, _guard: &RealGuard) -> bool {
     };
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-    if !foreground_is(hwnd) {
+    if !ensure_foreground(hwnd, Phase::RealDrag) {
         note(Phase::RealDrag, "守卫拦截：前台不是本窗口，未发送任何事件");
         return false;
     }
@@ -455,7 +533,7 @@ pub fn real_drag(hwnd: HWND, _guard: &RealGuard) -> bool {
 
 /// 真实按键：一个虚拟键（走 `WM_KEYDOWN`）+ 三个 Unicode 字符（走 `WM_CHAR`/`WM_IME_CHAR`）。
 pub fn real_type(hwnd: HWND, _guard: &RealGuard) -> usize {
-    if !foreground_is(hwnd) {
+    if !ensure_foreground(hwnd, Phase::RealType) {
         note(Phase::RealType, "守卫拦截：前台不是本窗口，未发送任何事件");
         return 0;
     }

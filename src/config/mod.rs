@@ -275,7 +275,7 @@ impl Default for WindowConfig {
             opacity: 0.88,
             padding: 10,
             border_radius: 8,
-            sink_when_unfocused: false,
+            sink_when_unfocused: true,
         }
     }
 }

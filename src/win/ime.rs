@@ -6,7 +6,7 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::Ime::{
-    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_RESULTSTR,
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR, GCS_RESULTSTR,
 };
 
 /// 取本次 `WM_IME_COMPOSITION` 的上屏字符串。
@@ -41,5 +41,34 @@ pub fn result_string(hwnd: HWND) -> Option<String> {
         };
         let _ = ImmReleaseContext(hwnd, context);
         text
+    }
+}
+
+/// 是否正在组字（有未上屏的拼音串）。
+pub fn is_composing(hwnd: HWND) -> bool {
+    // SAFETY: 同上，只读查询。
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.is_invalid() {
+            return false;
+        }
+        let bytes = ImmGetCompositionStringW(context, GCS_COMPSTR, None, 0);
+        let _ = ImmReleaseContext(hwnd, context);
+        bytes > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 没有任何输入上下文时（自检窗口没有 IME 绑定），两条查询都必须安全地返回 false，
+    /// 而不是崩或 panic。
+    #[test]
+    fn queries_are_safe_without_a_context() {
+        use windows::Win32::Foundation::HWND;
+        let null = HWND(std::ptr::null_mut());
+        assert!(!is_composing(null));
+        assert!(result_string(null).is_none());
     }
 }

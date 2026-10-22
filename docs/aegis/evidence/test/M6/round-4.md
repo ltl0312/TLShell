@@ -1,4 +1,4 @@
-# 第 4 轮全量测试（2026-10-22 20:44:17 +08:00）
+# 第 4 轮全量测试（2026-10-22 22:21:17 +08:00）
 
 本轮参数：opacity=0.88 padding=14 radius=12
 
@@ -8,7 +8,7 @@
 |---|---|---|---|
 | A | cargo fmt --check | PASS | 格式一致 |
 | A | cargo clippy -D warnings | PASS | 无告警 |
-| A | cargo test | PASS | 161 passed |
+| A | cargo test | PASS | 167 passed |
 | B | selftest 全部通过 | PASS | 12 项 |
 | B | selftest 退出码 | PASS | exit=0 |
 | C | 窗口创建为顶层 | PASS | window hwnd=0x |
@@ -24,7 +24,7 @@
 | C | 代理对四字节写入 | PASS | 自检写入 4 字节 |
 | C | 结算键盘就绪 | PASS | 输入自检\[结算\].*已写入 PTY 14 字节 |
 | C | 前台已归还 | PASS | 前台已还给\|没有可归还的前台\|已不存在，跳过归还 |
-| C | 启动即可见可点 | PASS | 取前台=False 顶层抬升=True |
+| C | 启动即可见可点 | PASS | 取前台=False 顶层抬升=False 桌面层=True 可见且沉底=True |
 | C | 首帧落盘 | PASS | aegis-frame.bmp |
 | C | BMP 尺寸 | PASS | 900x420 |
 | C | 通道序 R/B 未颠倒 | PASS | bg=R57 G57 B71，期望 57/57/71（opacity=0.88） |
@@ -43,12 +43,13 @@
 | D | 坏配置仍能启动 | PASS | alive=True |
 | D | 缺 USERPROFILE 拒绝启动 | PASS | exited=True exit=1 |
 | E | 真实点击命中自己 | PASS | 真实点击@.*moved=true down=true up=true |
-| E | 真实点击拿到焦点 | PASS | 点击取焦点: foreground=true focus_set=true keyboard_ready=true |
+| E | 真实点击拿到焦点 | PASS | (点击取焦点: foreground=true\|抬到最前 foreground=true) |
 | E | 真实拖选出选区 | PASS | 扩展选择 -> line=\d+ col=\d+ 选区=Some |
 | E | 真实按键写进 PTY | PASS | 真实输入结算: 点击=\d+ 按键=[1-9]\d* 写入 PTY=[1-9]\d* 字节 |
 | E | 真实按键敲出 ipconfig | PASS | (?s)自检写入 1 字节: \[105\].*?\[112\].*?\[99\].*?\[111\].*?\[110\].*?\[102\].*?\[105\].*?\[103\] |
+| E | 输入法上屏去重 | PASS | IME 去重自检: 第一次写入=[1-9]\d* 字节 第二次写入=0 字节 去重=true |
 | E | 前台已归还 | PASS | 前台已还给\|没有可归还的前台 |
 
-汇总：PASS=42
+汇总：PASS=43
 
 C 层只向自己的窗口 `PostMessage`，不注入系统级输入；自检结束把前台还给原窗口。
