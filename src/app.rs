@@ -113,6 +113,12 @@ pub struct App {
     last_render: Instant,
     /// `WM_KEYDOWN` 已经处理过的键，抑制随后那条重复的 `WM_CHAR`。
     suppress_next_char: bool,
+    /// 实际使用的配置文件路径（`--config` 可覆盖）。
+    config_path: std::path::PathBuf,
+    /// 上次看到的配置文件修改时间，用于热重载判定。
+    config_mtime: Option<std::time::SystemTime>,
+    /// 上次轮询配置文件的时间。
+    last_watch: Instant,
 }
 
 impl App {
@@ -148,6 +154,9 @@ impl App {
             dirty: false,
             last_render: Instant::now(),
             suppress_next_char: false,
+            config_path: crate::config::config_path(),
+            config_mtime: None,
+            last_watch: Instant::now(),
         }
     }
 
@@ -350,8 +359,92 @@ impl App {
             }
         }
 
+        self.apply_shape(hwnd);
         self.dirty = true;
         Ok(())
+    }
+
+    /// 按当前配置把窗口裁成圆角。
+    ///
+    /// 只在尺寸/圆角变化时调；`SetWindowRgn` 是有成本的系统调用。
+    fn apply_shape(&self, hwnd: HWND) {
+        let Ok(rect) = window::client_rect(hwnd) else {
+            return;
+        };
+        let window_dpi = dpi::window_dpi(hwnd);
+        let radius = dpi::scale(self.config.window.border_radius, dpi::BASE_DPI, window_dpi);
+        if let Err(err) = layered::apply_round_corners(hwnd, rect.w, rect.h, radius) {
+            diag::warn(&format!("圆角裁剪失败: {err:#}"));
+        }
+    }
+
+    // -------------------------------------------------------------- 配置热重载
+
+    /// 每秒轮询一次 `config.toml` 的修改时间，变了就重载。
+    ///
+    /// 用轮询而不是 `ReadDirectoryChangesW`：后者要额外线程和缓冲协议，
+    /// 而配置文件一年改不了几次，1 秒的延迟完全够用。
+    fn watch_config(&mut self) {
+        const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+        let now = Instant::now();
+        if now.duration_since(self.last_watch) < WATCH_INTERVAL {
+            return;
+        }
+        self.last_watch = now;
+
+        let mtime = std::fs::metadata(&self.config_path)
+            .and_then(|meta| meta.modified())
+            .ok();
+
+        // 第一次只记录基线，不算“变更”。
+        if self.config_mtime.is_none() {
+            self.config_mtime = mtime;
+            return;
+        }
+        if mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+        if mtime.is_none() {
+            // 文件被删掉了，保留当前配置，等它重新出现。
+            diag::warn("配置文件不见了，暂时沿用当前配置");
+            return;
+        }
+        self.reload_config();
+    }
+
+    /// 重新读取配置并应用到运行中的窗口。
+    fn reload_config(&mut self) {
+        let loaded = crate::config::load(Some(&self.config_path));
+        for warning in &loaded.warnings {
+            diag::warn(warning);
+        }
+        if loaded.config == self.config {
+            diag::debug("配置文件有改动但内容等价，跳过");
+            return;
+        }
+
+        let font_changed = loaded.config.font != self.config.font;
+        self.config = loaded.config;
+
+        if let Some(painter) = self.painter.as_mut() {
+            painter.theme = Theme::from_config(&self.config.colors);
+        }
+        let hwnd = self.hwnd;
+        if font_changed {
+            if let Err(err) = self.reload_fonts(hwnd) {
+                diag::warn(&format!("热重载字体失败: {err:#}"));
+            }
+        }
+        if let Err(err) = layered::set_opacity(hwnd, self.config.window.opacity) {
+            diag::warn(&format!("热重载透明度失败: {err:#}"));
+        }
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("热重载重排失败: {err:#}"));
+        }
+        self.dirty = true;
+        diag::info("配置已热重载");
     }
 
     // ---------------------------------------------------------------- 数据泵
@@ -461,6 +554,7 @@ impl App {
 
     fn tick(&mut self) {
         self.pump_pty();
+        self.watch_config();
 
         let now = Instant::now();
         if self.blink.tick(now) {

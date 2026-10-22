@@ -44,14 +44,18 @@ cargo build --release
 1. **Win+D 后焦点丢失**：需要点击终端才能继续输入。系统行为，无法绕过（Rainmeter 的输入框同样如此）。
 2. **点击终端会激活它**：这是能打字的必要条件。TLShell 不加 `WS_EX_NOACTIVATE`。
 3. **只有 alpha，没有模糊**：嵌入 WorkerW 后 DWM 的背景特效失效，亚克力/Mica 不可用。
-4. **无托盘、无关闭按钮**：退出靠全局热键 `Ctrl+Alt+Q`，或 `tlshell.exe --quit`。
-5. **只挂主屏**：多显示器场景下只在主屏的 WorkerW 上出现。
-6. **全屏游戏会遮住它**：符合预期。
-7. **Emoji 不保证显示**：字形回退链只覆盖拉丁与 CJK。
-8. **壁纸程序可能盖住它**：TLShell 挂在 `WorkerW` 层里，与 Wallpaper Engine 这类
+   整窗 alpha 是「文字和背景一起变透」，`opacity` 调到 0.5 时正文会明显发灰。
+   要做「背景透、文字不透」必须逐像素 alpha（`UpdateLayeredWindow`），
+   那会推翻 `softbuffer` 这条选型，不在计划书范围内。
+4. **圆角是硬边**：圆角由 `SetWindowRgn` 做区域裁剪实现，边缘没有抗锯齿。
+5. **无托盘、无关闭按钮**：退出靠全局热键 `Ctrl+Alt+Q`，或 `tlshell.exe --quit`。
+6. **只挂主屏**：多显示器场景下只在主屏的 WorkerW 上出现。
+7. **全屏游戏会遮住它**：符合预期。
+8. **Emoji 不保证显示**：字形回退链只覆盖拉丁与 CJK。
+9. **壁纸程序可能盖住它**：TLShell 挂在 `WorkerW` 层里，与 Wallpaper Engine 这类
    动态壁纸是同一层的兄弟窗口。TLShell 会把自己提到最前，但壁纸程序若持续抢占
    层级，仍可能被覆盖。
-9. **桌面图标会画在它上面**：`SHELLDLL_DefView` 与 `WorkerW` 是 `Progman` 的兄弟，
+10. **桌面图标会画在它上面**：`SHELLDLL_DefView` 与 `WorkerW` 是 `Progman` 的兄弟，
    图标层始终在上。这是“成为壁纸”的固有代价。
 
 ## 安全边界
