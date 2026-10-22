@@ -1,0 +1,4 @@
+# 风格参数。edition 由 Cargo.toml 决定（cargo fmt 自动读取），此处不重复声明。
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Windows"

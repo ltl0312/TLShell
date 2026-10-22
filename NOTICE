@@ -1,0 +1,39 @@
+TLShell
+Copyright (c) 2026 TLShell contributors
+Licensed under MIT OR Apache-2.0.
+
+---
+
+本项目的部分代码移植自第三方开源项目，其原始许可与版权声明如下。
+
+## Alacritty
+
+`src/term/input.rs` 的键盘编码逻辑移植自 Alacritty 的 `alacritty/src/input.rs`。
+
+    Copyright 2016 Joe Wilm, The Alacritty Project Contributors
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+## 依赖 crate
+
+| crate | 许可证 |
+|---|---|
+| `alacritty_terminal` | Apache-2.0 |
+| `portable-pty` | MIT |
+| `softbuffer` | MIT / Apache-2.0 |
+| `fontdue` | MIT / Apache-2.0 |
+| `windows` | MIT / Apache-2.0 |
+| `serde` / `serde_json` | MIT / Apache-2.0 |
+| `toml` | MIT / Apache-2.0 |
+| `anyhow` | MIT / Apache-2.0 |
+| `raw-window-handle` | MIT / Apache-2.0 |

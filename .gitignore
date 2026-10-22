@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 本地运行产物
+run.log
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
