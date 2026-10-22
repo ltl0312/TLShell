@@ -7,7 +7,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -118,19 +119,51 @@ impl Terminal {
     }
 
     /// 正数向上滚（看历史），负数向下滚。
-    #[allow(dead_code)] // M5 滚动回看用
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
-    #[allow(dead_code)] // M5 滚动回看用
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
     }
 
-    #[allow(dead_code)] // M5 选中复制用
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
+    }
+
+    /// 视口顶部相对历史缓冲的偏移行数（滚回历史后为正）。
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// 当前选中的文字范围（起点、终点）。没选区或选区为空时返回 `None`。
+    pub fn selection_range(&self) -> Option<(Point, Point)> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        if range.start == range.end {
+            return None;
+        }
+        Some((range.start, range.end))
+    }
+
+    /// 起一个简单选区。坐标是**网格坐标**（行号已扣掉 `display_offset`）。
+    pub fn start_selection(&mut self, point: Point) {
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// 拖拽时更新选区终点。
+    pub fn update_selection(&mut self, point: Point) {
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        }
+    }
+
+    /// 清掉选区。
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
     }
 
     /// 供渲染层直接按行列取单元格。
@@ -208,6 +241,39 @@ mod tests {
             Event::PtyWrite(text) => assert_eq!(text, "\x1b[1;1R"),
             other => panic!("期望 PtyWrite，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn selection_extracts_text_from_grid() {
+        let mut term = terminal(20, 4);
+        term.feed(b"hello world");
+        // 第 0 行第 0 列到第 4 列，也就是 "hello"。
+        term.start_selection(Point::new(Line(0), Column(0)));
+        term.update_selection(Point::new(Line(0), Column(4)));
+        assert!(term.has_selection());
+        assert_eq!(term.selection_text().as_deref(), Some("hello"));
+
+        term.clear_selection();
+        assert!(!term.has_selection());
+        assert_eq!(term.selection_text(), None);
+    }
+
+    #[test]
+    fn selection_survives_scrolling_into_history() {
+        let (mut term, _rx) = Terminal::new(TermSize::new(20, 2), 100, Osc52::Disabled);
+        for i in 0..10 {
+            {
+                term.feed(format!("line{i}").as_bytes());
+                term.feed(b"\r\n");
+            }
+        }
+        // 视口默认停在底部，要显式往回滚才看得到历史。
+        term.scroll(5);
+        assert!(term.display_offset() > 0);
+        // 滚回历史后行号是负的；选区照样能取出文字。
+        term.start_selection(Point::new(Line(-1), Column(0)));
+        term.update_selection(Point::new(Line(-1), Column(3)));
+        assert!(term.has_selection());
     }
 
     #[test]

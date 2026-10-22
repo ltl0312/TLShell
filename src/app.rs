@@ -12,6 +12,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event;
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Osc52, TermMode};
 use anyhow::{Context, Result};
 use raw_window_handle::{
@@ -19,16 +20,23 @@ use raw_window_handle::{
     RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
 };
 use softbuffer::{Context as SoftContext, Surface};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+use windows::Win32::UI::Input::Ime::{
+    ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostQuitMessage,
-    SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
-    HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MSG,
-    SW_HIDE, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE,
-    WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+    HTTOPRIGHT, MSG, SW_HIDE, SW_SHOW, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_IME_CHAR,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
+    WM_TIMER,
 };
 
 use crate::config::Config;
@@ -39,7 +47,7 @@ use crate::term::session::{Session, SpawnOptions};
 use crate::term::{shell, TermSize, Terminal};
 use crate::win::hotkey::{self, Hotkey};
 use crate::win::window::{self, WindowSpec};
-use crate::win::{dpi, layered};
+use crate::win::{clipboard, dpi, layered, single};
 
 pub mod selftest;
 
@@ -119,6 +127,10 @@ pub struct App {
     config_mtime: Option<std::time::SystemTime>,
     /// 上次轮询配置文件的时间。
     last_watch: Instant,
+    /// 是否正在拖拽选择文字。
+    selecting: bool,
+    /// `TaskbarCreated` 的消息号（`RegisterWindowMessageW` 的返回值，0 表示没注册上）。
+    taskbar_created: u32,
 }
 
 impl App {
@@ -157,6 +169,8 @@ impl App {
             config_path: crate::config::config_path(),
             config_mtime: None,
             last_watch: Instant::now(),
+            selecting: false,
+            taskbar_created: 0,
         }
     }
 
@@ -208,10 +222,21 @@ impl App {
     // ---------------------------------------------------------------- 初始化
 
     /// `WM_CREATE` 里做一次性的重量级初始化。
+    /// 注册 `TaskbarCreated`，Explorer 重启后能收到通知（见 `reattach`）。
+    fn register_taskbar_message(&mut self) {
+        // SAFETY: 参数是静态宽字符串。
+        let id = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
+        self.taskbar_created = id;
+        if id == 0 {
+            diag::warn("注册 TaskbarCreated 失败，Explorer 重启后无法自动重挂");
+        }
+    }
+
     fn initialize(&mut self, hwnd: HWND) -> Result<()> {
         if self.headless {
             return Ok(());
         }
+        self.register_taskbar_message();
         self.ensure_surface(hwnd)?;
         self.reload_fonts(hwnd)?;
         self.apply_size(hwnd)?;
@@ -447,6 +472,171 @@ impl App {
         diag::info("配置已热重载");
     }
 
+    // ------------------------------------------------------ 鼠标：选择与滚动
+
+    /// 把客户区坐标换算成网格坐标（行号已扣掉历史回滚偏移）。
+    fn cell_at(&self, x: i32, y: i32) -> Option<Point> {
+        let (column, row) = self.layout.hit(x, y)?;
+        let offset = self
+            .terminal
+            .as_ref()
+            .map_or(0, |term| term.display_offset());
+        let line = row as i32 - offset as i32;
+        Some(Point::new(Line(line), Column(column)))
+    }
+
+    /// 按下左键：起一个选区并捕获鼠标。
+    fn begin_selection(&mut self, hwnd: HWND, lparam: LPARAM) {
+        let (x, y) = client_point(lparam);
+        let Some(point) = self.cell_at(x, y) else {
+            diag::debug(&format!("({x},{y}) 落在网格外，忽略"));
+            return;
+        };
+        diag::debug(&format!(
+            "开始选择 @ ({x},{y}) -> line={} col={}",
+            point.line.0, point.column.0
+        ));
+        if let Some(term) = self.terminal.as_mut() {
+            term.start_selection(point);
+        }
+        self.selecting = true;
+        // SAFETY: 捕获鼠标，拖到窗口外也能继续收到 mousemove；由 end_selection 释放。
+        unsafe {
+            SetCapture(hwnd);
+        }
+        self.dirty = true;
+    }
+
+    fn drag_selection(&mut self, lparam: LPARAM) {
+        if !self.selecting {
+            return;
+        }
+        let (x, y) = client_point(lparam);
+        let Some(point) = self.cell_at(x, y) else {
+            diag::debug(&format!("({x},{y}) 落在网格外，忽略"));
+            return;
+        };
+        if let Some(term) = self.terminal.as_mut() {
+            term.update_selection(point);
+            diag::debug(&format!(
+                "扩展选择 -> line={} col={} 选区={:?}",
+                point.line.0,
+                point.column.0,
+                term.selection_range()
+            ));
+        }
+        self.dirty = true;
+    }
+
+    fn end_selection(&mut self) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        // SAFETY: 与 SetCapture 配对；没捕获成功时释放是无害的。
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+
+    /// 把当前选区写进剪贴板，然后清掉选区。
+    fn copy_selection(&mut self) {
+        let Some(text) = self
+            .terminal
+            .as_ref()
+            .and_then(|term| term.selection_text())
+        else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        match clipboard::set_text(&text) {
+            Ok(()) => diag::info(&format!("已复制 {} 个字符", text.chars().count())),
+            Err(err) => diag::warn(&format!("复制到剪贴板失败: {err:#}")),
+        }
+        if let Some(term) = self.terminal.as_mut() {
+            term.clear_selection();
+        }
+        self.dirty = true;
+    }
+
+    /// 滚轮回看历史。`lines` 正数向上（看历史）。
+    fn scroll_view(&mut self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        if let Some(term) = self.terminal.as_mut() {
+            term.scroll(lines);
+        }
+        self.dirty = true;
+    }
+
+    // ------------------------------------------------------------ 输入法
+
+    /// 把输入法的候选窗口挪到光标处，否则它会固定出现在窗口左上角。
+    fn position_ime(&self, hwnd: HWND) {
+        let (Some(term), Some(painter)) = (self.terminal.as_ref(), self.painter.as_ref()) else {
+            return;
+        };
+        let point = term.cursor_point();
+        let row = point.line.0 + term.display_offset() as i32;
+        let (x, y) = self.layout.cell_origin(point.column.0, row.max(0) as usize);
+        // SAFETY: hwnd 有效；himc 用完立刻释放，不跨消息持有。
+        unsafe {
+            let himc = ImmGetContext(hwnd);
+            if himc.is_invalid() {
+                return;
+            }
+            let form = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: POINT {
+                    x,
+                    y: y + painter.fonts.ascent,
+                },
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCompositionWindow(himc, &form);
+            let _ = ImmReleaseContext(hwnd, himc);
+        }
+    }
+
+    /// 直接把一个字符送进 PTY（输入法上屏走这条，不经过 `WM_CHAR` 去重逻辑）。
+    fn send_char(&mut self, ch: char) {
+        let mut buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buf);
+        self.write_to_pty(encoded.as_bytes());
+    }
+
+    // -------------------------------------------------- Explorer 重启后重挂
+
+    /// `Explorer` 重启会连带销毁它名下的 `WorkerW`。
+    ///
+    /// 我们作为子窗口通常已经一起没了，所以这里只能做「尽力而为」：
+    /// 窗口还在就重新找 `WorkerW` 挂上去，并重建区域与分层属性。
+    fn reattach(&mut self, hwnd: HWND) {
+        diag::info("收到 TaskbarCreated，尝试重新挂到桌面层");
+        match crate::win::workerw::attach(hwnd) {
+            crate::win::workerw::Attach::Attached { workerw, strategy } => {
+                diag::info(&format!(
+                    "重挂成功: {} via {strategy}",
+                    window::describe(workerw)
+                ));
+            }
+            crate::win::workerw::Attach::Fallback { reason } => {
+                diag::warn(&format!("重挂失败，退回普通窗口: {reason}"));
+            }
+        }
+        // 变成子窗口后必须重新设置分层属性，否则不参与合成（M2 踩过）。
+        if let Err(err) = layered::set_opacity(hwnd, self.config.window.opacity) {
+            diag::warn(&format!("重挂后恢复透明度失败: {err:#}"));
+        }
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("重挂后重排失败: {err:#}"));
+        }
+        self.dirty = true;
+    }
+
     // ---------------------------------------------------------------- 数据泵
 
     /// 取走 PTY 输出并喂给 VT 状态机，然后处理终端事件。
@@ -500,6 +690,13 @@ impl App {
     }
 
     fn write_to_pty(&mut self, bytes: &[u8]) {
+        // 一边往回翻历史一边敲键盘，说明用户想回到当前输出，先跳回底部。
+        if let Some(term) = self.terminal.as_mut() {
+            if term.display_offset() > 0 {
+                term.scroll_to_bottom();
+                self.dirty = true;
+            }
+        }
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -520,6 +717,18 @@ impl App {
         // Shift 状态与输入法组合结果。
         if matches!(key, Key::Char(_)) && !mods.ctrl && !mods.alt {
             return;
+        }
+        // Ctrl+C 有双重语义：有选区时是「复制」，没选区时才是中断。
+        // 计划书与安全评审 S-13 都要求这两件事不共用同一次按键语义。
+        if mods.ctrl && !mods.alt && matches!(key, Key::Char('c') | Key::Char('C')) {
+            let has_selection = self
+                .terminal
+                .as_ref()
+                .is_some_and(|term| term.has_selection());
+            if has_selection {
+                self.copy_selection();
+                return;
+            }
         }
         let mode = self
             .terminal
@@ -795,6 +1004,53 @@ impl App {
                 self.dirty = true;
                 Some(LRESULT(0))
             }
+            WM_LBUTTONDOWN => {
+                diag::debug(&format!(
+                    "收到 WM_LBUTTONDOWN lparam=0x{:x} -> {:?}",
+                    lparam.0,
+                    client_point(lparam)
+                ));
+                // 点一下就把焦点拿回来：桌面层窗口不会自动激活。
+                // SAFETY: hwnd 有效。
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                }
+                self.begin_selection(hwnd, lparam);
+                Some(LRESULT(0))
+            }
+            WM_MOUSEMOVE => {
+                self.drag_selection(lparam);
+                None
+            }
+            WM_LBUTTONUP => {
+                self.end_selection();
+                Some(LRESULT(0))
+            }
+            WM_CAPTURECHANGED => {
+                // 鼠标被别人抢走（比如弹了系统菜单），别把 selecting 挂在那儿。
+                self.selecting = false;
+                None
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                // 一格 120，一次滚 3 行；正数（滚轮向前）看历史。
+                self.scroll_view(delta / 120 * 3);
+                Some(LRESULT(0))
+            }
+            WM_IME_STARTCOMPOSITION => {
+                self.position_ime(hwnd);
+                None
+            }
+            WM_IME_CHAR => {
+                diag::debug(&format!("收到 WM_IME_CHAR wparam=0x{:x}", wparam.0));
+                if let Some(ch) = char::from_u32(wparam.0 as u32) {
+                    diag::debug(&format!("输入法上屏 {ch:?}"));
+                    self.send_char(ch);
+                }
+                // 输入法上屏后系统还会再发一条 WM_CHAR，丢掉避免重复。
+                self.suppress_next_char = true;
+                Some(LRESULT(0))
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wparam.0 as u32;
                 let mods = current_modifiers();
@@ -844,9 +1100,30 @@ impl App {
                 unsafe { PostQuitMessage(0) };
                 Some(LRESULT(0))
             }
+            other if other == self.taskbar_created && other != 0 => {
+                self.reattach(hwnd);
+                Some(LRESULT(0))
+            }
+            other if other == single::WAKE_MESSAGE => {
+                // 第二个实例启动时叫醒我们。
+                // SAFETY: hwnd 有效。
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                }
+                self.dirty = true;
+                Some(LRESULT(0))
+            }
             _ => None,
         }
     }
+}
+
+/// 从 `LPARAM` 里取出客户区坐标（低 16 位 x、高 16 位 y，各自按 16 位符号扩展）。
+fn client_point(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+    (x, y)
 }
 
 /// OSC 52 策略：默认关闭；打开也只允许写入剪贴板，读方向永久禁用。
@@ -859,12 +1136,15 @@ fn osc52_mode(config: &Config) -> Osc52 {
 }
 
 fn current_modifiers() -> Modifiers {
-    // SAFETY: GetKeyState 只读当前线程的键盘状态。
+    // 用 `GetAsyncKeyState` 而不是 `GetKeyState`：桌面层窗口可能通过投递消息、
+    // 输入法或热键路径拿到按键，此时线程键盘状态未必被更新过，
+    // 读全局物理按键状态才不会把 Ctrl 判成没按。
+    // SAFETY: 三个参数都是常量虚拟键码，只读全局键状态。
     unsafe {
         Modifiers {
-            shift: GetKeyState(VK_SHIFT.0 as i32) < 0,
-            ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
-            alt: GetKeyState(VK_MENU.0 as i32) < 0,
+            shift: GetAsyncKeyState(VK_SHIFT.0 as i32) < 0,
+            ctrl: GetAsyncKeyState(VK_CONTROL.0 as i32) < 0,
+            alt: GetAsyncKeyState(VK_MENU.0 as i32) < 0,
         }
     }
 }
@@ -970,6 +1250,8 @@ pub fn run(config: Config, rect: Option<dpi::Rect>) -> Result<i32> {
 
     let hwnd = window::create(hinstance, &spec, app_ptr)?;
     app.hwnd = hwnd;
+    // 记下句柄，第二个实例靠它唤醒我们（子窗口用 FindWindowW 找不到）。
+    single::remember(hwnd.0 as isize);
 
     // 顺序很重要：先改父子关系，再设置分层属性。
     // 反过来做的话，`SetLayeredWindowAttributes` 记录的是“顶层窗口”的分层表面，

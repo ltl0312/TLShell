@@ -16,8 +16,8 @@ TLShell 是一个 Rust 写的终端模拟器，它的窗口不是普通顶层窗
 | M1 | PTY 与渲染（ConPTY、VT 状态机、字形绘制） | 完成 |
 | M2 | 桌面层挂载（WorkerW 父窗口、拖动与缩放） | 完成 |
 | M3 | 配置与位置持久化（config.toml、state.json） | 完成 |
-| M4 | 玻璃外观 | 待开始 |
-| M5 | 打磨与稳定性 | 待开始 |
+| M4 | 玻璃外观（圆角裁剪、透明度、配置热重载） | 完成 |
+| M5 | 打磨与稳定性（滚动回看、选中复制、IME、单实例） | 完成 |
 
 ## 构建
 
@@ -57,6 +57,9 @@ cargo build --release
    层级，仍可能被覆盖。
 10. **桌面图标会画在它上面**：`SHELLDLL_DefView` 与 `WorkerW` 是 `Progman` 的兄弟，
    图标层始终在上。这是“成为壁纸”的固有代价。
+11. **不支持拖放文件**：不注册 `WS_EX_ACCEPTFILES`，也不处理 `WM_DROPFILES`。
+12. **输入法只做定位与上屏**：`WM_IME_STARTCOMPOSITION` 时把候选窗口挪到光标位置，
+    `WM_IME_CHAR` 直接写入 PTY；候选框样式与行内预编辑显示交给系统 IME。
 
 ## 安全边界
 
@@ -64,6 +67,8 @@ cargo build --release
 - shell 可执行文件按白名单解析为**绝对路径**，不做当前目录回退。
 - OSC 52 剪贴板写入默认关闭；粘贴会剥离 C0/C1 控制字符。
 - 日志落 `%LOCALAPPDATA%\TLShell\logs\`，默认 `warn` 级别，**不记录** PTY 字节流、键盘输入与剪贴板内容。
+- 子进程放进 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 作业对象：TLShell 退出时 shell 一并结束，不留孤儿进程。
+- 单实例：命名互斥体判重，第二个实例用 `%APPDATA%\TLShell\hwnd.txt` 记的句柄唤醒已有窗口后退出。
 
 ## 文档
 

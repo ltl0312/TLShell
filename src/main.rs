@@ -42,6 +42,20 @@ fn main() -> ExitCode {
 
     diag::init();
 
+    // 单实例锁必须活到进程结束，所以绑在 main 里而不是 run_normal 里。
+    let _instance = if options.selftest || options.quit {
+        None
+    } else {
+        match win::single::ensure_single() {
+            Ok(lock) => lock,
+            Err(err) => return fail(&format!("单实例检测失败: {err:#}")),
+        }
+    };
+    if _instance.is_none() && !options.selftest && !options.quit {
+        // 已有实例在跑：唤醒它之后安静退出，不算错误。
+        return ExitCode::SUCCESS;
+    }
+
     let result = if options.selftest {
         run_selftest(&options)
     } else if options.quit {

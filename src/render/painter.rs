@@ -110,6 +110,16 @@ impl Painter {
         let display_offset = grid.display_offset() as i32;
         let mode = term.mode();
 
+        // 选区换成屏幕坐标（行号加回滚偏移），边界用闭区间。
+        let selection = term.selection_range().map(|(start, end)| {
+            (
+                start.line.0 + display_offset,
+                start.column.0,
+                end.line.0 + display_offset,
+                end.column.0,
+            )
+        });
+
         for row in 0..layout.rows {
             let line = Line(row as i32 - display_offset);
             for col in 0..layout.cols {
@@ -119,7 +129,20 @@ impl Painter {
                 {
                     continue;
                 }
-                self.draw_cell(frame, layout, cell, row, col);
+                let selected = selection.is_some_and(|(sl, sc, el, ec)| {
+                    let row = row as i32;
+                    if sl == el {
+                        // 单行选区：只覆盖首尾列之间。
+                        row == sl && col >= sc && col <= ec
+                    } else if row == sl {
+                        col >= sc
+                    } else if row == el {
+                        col <= ec
+                    } else {
+                        row > sl && row < el
+                    }
+                });
+                self.draw_cell(frame, layout, cell, row, col, selected);
             }
         }
 
@@ -137,6 +160,7 @@ impl Painter {
         cell: &alacritty_terminal::term::cell::Cell,
         row: usize,
         col: usize,
+        selected: bool,
     ) {
         let (x0, y0) = layout.cell_origin(col, row);
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
@@ -156,6 +180,11 @@ impl Painter {
         } else if cell.flags.contains(Flags::DIM) {
             // 用 60% 覆盖度把前景色往背景上拉，模拟暗色。
             fg = blend(bg, fg, 153);
+        }
+
+        // 选区底色优先于单元格自身的背景，否则彩色输出会把选区淹没。
+        if selected {
+            bg = self.theme.selection;
         }
 
         if bg != self.theme.background {
