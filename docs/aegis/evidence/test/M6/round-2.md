@@ -1,4 +1,4 @@
-# 第 2 轮全量测试（2026-10-22 20:15:37 +08:00）
+# 第 2 轮全量测试（2026-10-22 20:42:24 +08:00）
 
 本轮参数：opacity=0.84 padding=10 radius=8
 
@@ -8,7 +8,7 @@
 |---|---|---|---|
 | A | cargo fmt --check | PASS | 格式一致 |
 | A | cargo clippy -D warnings | PASS | 无告警 |
-| A | cargo test | PASS | 159 passed |
+| A | cargo test | PASS | 161 passed |
 | B | selftest 全部通过 | PASS | 12 项 |
 | B | selftest 退出码 | PASS | exit=0 |
 | C | 窗口创建为顶层 | PASS | window hwnd=0x |
@@ -42,7 +42,13 @@
 | D | 未知参数被拒绝 | PASS | exit=1 |
 | D | 坏配置仍能启动 | PASS | alive=True |
 | D | 缺 USERPROFILE 拒绝启动 | PASS | exited=True exit=1 |
+| E | 真实点击命中自己 | PASS | 真实点击@.*moved=true down=true up=true |
+| E | 真实点击拿到焦点 | PASS | 点击取焦点: foreground=true focus_set=true keyboard_ready=true |
+| E | 真实拖选出选区 | PASS | 扩展选择 -> line=\d+ col=\d+ 选区=Some |
+| E | 真实按键写进 PTY | PASS | 真实输入结算: 点击=\d+ 按键=[1-9]\d* 写入 PTY=[1-9]\d* 字节 |
+| E | 真实按键敲出 ipconfig | PASS | (?s)自检写入 1 字节: \[105\].*?\[112\].*?\[99\].*?\[111\].*?\[110\].*?\[102\].*?\[105\].*?\[103\] |
+| E | 前台已归还 | PASS | 前台已还给\|没有可归还的前台 |
 
-汇总：PASS=36
+汇总：PASS=42
 
 C 层只向自己的窗口 `PostMessage`，不注入系统级输入；自检结束把前台还给原窗口。

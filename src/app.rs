@@ -1176,15 +1176,21 @@ impl App {
             // 2. 某些注入路径把所有键都送成 `VK_PACKET`，但扫描码是真实扫描码
             //    （例如 A 键是 0x1e），这时按扫描码反查虚拟键再翻译，
             //    否则物理键盘在这里会「打得出来却变成控制字符」。
-            if scan >= 0x20 {
-                self.commit_ime_unit(scan);
-            } else {
-                let text = crate::win::text::text_for_packet(scan);
-                if !text.is_empty() {
-                    for ch in text.chars() {
-                        self.send_char(ch);
-                    }
+            // 顺序不能反：真键盘走虚拟化/注入路径时扫描码是**真实扫描码**
+            // （C 键 0x2E、N 键 0x31），若先按「UTF-16 码元」解释，用户敲
+            // `ipconfig` 会看到 `ip.o1!i"ipconfig`——每个 ≥0x20 的键变成
+            // 扫描码对应的标点/数字。只有扫描码解释失败（≥0x80，不可能是
+            // 扫描码）才退回 UTF-16 码元，那条路给 CJK 与 emoji 用。
+            let text = crate::win::text::text_for_packet(scan);
+            if !text.is_empty() {
+                for ch in text.chars() {
+                    self.send_char(ch);
                 }
+                // 同一个键随后还会来一条 `WM_CHAR`（真键盘路径实测如此），
+                // 不设抑制窗就会写两遍：乱码 + 正确字符各一份。
+                self.suppress_char_until = Some(Instant::now() + SUPPRESS_CHAR_WINDOW);
+            } else if scan >= 0x20 {
+                self.commit_ime_unit(scan);
             }
             return;
         }

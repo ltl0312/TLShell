@@ -75,7 +75,9 @@ pub fn text_for(vk: u16, scan: u16) -> String {
 /// `Shift+A`、`;`、`/` 才拿得到正确字符。
 pub fn text_for_packet(scan: u16) -> String {
     use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK_EX};
-    if scan == 0 {
+    // 扫描码是 7 位量（扩展键用 E0 前缀，不在这个字段里）。超出范围的
+    // 值不可能是扫描码，交给「UTF-16 码元」那条解释去处理。
+    if scan == 0 || scan >= 0x80 {
         return String::new();
     }
     // SAFETY: 纯换算，无副作用。
@@ -94,6 +96,29 @@ mod tests {
     fn unmapped_key_yields_nothing() {
         // 0xFF 不是真实虚拟键，翻译结果必须是空串而不是乱码。
         assert!(text_for(0xff, 0).is_empty());
+    }
+
+    #[test]
+    fn packet_scan_codes_are_never_read_as_raw_code_points() {
+        // 真缺陷回归：把扫描码当成 UTF-16 码元解释时，敲 `ipconfig` 会写出
+        // `ip.o1!i"ipconfig`（C=0x2E→'.'、N=0x31→'1'、F=0x21→'!'、G=0x22→'"'）。
+        // 判据：任何扫描码都不得原样变成「数值相同的字符」。
+        // 不比对具体字母——测试线程没有真实键盘布局时 `ToUnicodeEx` 可能返回空，
+        // 那是环境影响，不是缺陷；字母正确性由 `--probe-real` 在真窗口上验完整词。
+        for scan in [0x17_u16, 0x19, 0x2e, 0x18, 0x31, 0x21, 0x22, 0x20] {
+            let got = text_for_packet(scan);
+            let raw = char::from_u32(u32::from(scan)).map(String::from);
+            assert_ne!(Some(got.clone()), raw, "扫描码 {scan:#04x} 被当成码元");
+            assert!(got.chars().count() <= 1, "扫描码 {scan:#04x} 产出多个字符");
+        }
+    }
+
+    #[test]
+    fn non_scan_values_fall_through_to_the_unicode_reading() {
+        // ≥0x80 不可能是扫描码，必须返回空串，让调用方按 UTF-16 码元处理（CJK）。
+        for scan in [0x80_u16, 0x4e2d, 0xfffd] {
+            assert!(text_for_packet(scan).is_empty(), "扫描码 {scan:#04x}");
+        }
     }
 
     #[test]

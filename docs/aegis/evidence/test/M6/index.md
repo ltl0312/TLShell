@@ -16,26 +16,30 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
 | B 无界面自检 | `--selftest --report`，逐项断言 `ok`（12 项，含 IME 结果串空值），并断言退出码 | 2 |
 | C 真机功能探针 | `--probe-input --dump-frame`：日志链路 14 项 + 落盘像素 5 项 + 单实例 1 项 + 设置面板 4 项 + 唤起热键 1 项 | 25 |
 | D 行为负例 | `--quit` 真退出、`--restart-unelevated` 非提权退 0、未知参数拒绝、坏配置仍启动、缺 `USERPROFILE` 拒绝启动、白/黑壁纸对比度 | 6 |
-| E 真实输入（可选，`-RealInput`） | `--probe-real`：真实点击命中自己、拿到焦点、拖选出选区、按键写进 PTY、归还前台 | 5 |
+| E 真实输入（可选，`-RealInput`） | `--probe-real`：真实点击命中自己、拿到焦点、拖选出选区、按键写进 PTY、**敲出整词 `ipconfig`**、归还前台 | 6 |
 
-合计 **36 项/轮**。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
+合计 **42 项/轮**（含 E 层时）。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
 结束时把前台还给原窗口，因此可以在用户正常工作时不打断地跑。
 
 ## 结果
 
 | 轮次 | 参数组合（`opacity` / `padding` / `radius` / `font`） | 结论 | 报告 |
 |---|---|---|---|
-| 1 | 0.82 / 8 / 6 / 13 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
-| 2 | 0.84 / 10 / 8 / 14 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
-| 3 | 0.86 / 12 / 10 / 15 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
-| 4 | 0.88 / 14 / 12 / 16 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
-| 5 | 0.90 / 16 / 14 / 17 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
-| 6 | 0.92 / 18 / 16 / 18 | PASS 36 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
+| 1 | 0.82 / 8 / 6 / 13 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
+| 2 | 0.84 / 10 / 8 / 14 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
+| 3 | 0.86 / 12 / 10 / 15 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
+| 4 | 0.88 / 14 / 12 / 16 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
+| 5 | 0.90 / 16 / 14 / 17 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
+| 6 | 0.92 / 18 / 16 / 18 | PASS 42 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
 
 每轮用 `%TEMP%\aegis-round-N\config.toml` 换一组参数，所以六轮不只是「同一套用例跑六次」：
 它同时验证参数变化（透明度、内边距、圆角、字号）不会破坏任何链路。
 
-`cargo test` 159 passed，clippy 零告警，fmt 干净。
+每轮还配一个干净的 `%APPDATA%`（`%TEMP%\aegis-round-N\appdata`）：`state.json` 会记住上一轮的
+窗口尺寸并顶掉 `config` 的 `width/height`，不隔离的话 C 层像素判据会读到上一轮的几何
+（本轮就踩到 `1024x730`）。
+
+`cargo test` 161 passed，clippy 零告警，fmt 干净。
 
 ## 关键断言（不是「跑完没报错」）
 
@@ -50,6 +54,8 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
 - **圆角抗锯齿**：角点完全透明（合成白），上边缘不透明——硬边裁剪做不到这一点。
 - **壁纸两端对比度**：白底 8.23:1、黑底 9.09:1，都过 WCAG AA。
 - **自检不抢用户**：`前台已还给 <hwnd>（True）`，或明确记录「没有可归还的前台」。
+- **键盘字符真的对**：真实按键敲 `ipconfig`，八个字节必须按顺序是
+  `105,112,99,111,110,102,105,103`。这条是「扫描码被当成 UTF-16 码元」缺陷的端到端回归。
 
 ## 诚实范围
 

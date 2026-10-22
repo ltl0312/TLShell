@@ -461,15 +461,26 @@ pub fn real_type(hwnd: HWND, _guard: &RealGuard) -> usize {
     }
     // 只用虚拟键：这是物理键盘唯一的送法。`KEYEVENTF_UNICODE` 注入在本机
     // 会以 `scan=0` 到达窗口（字符丢失），拿它当判据会把环境缺陷算到产品头上。
-    // 三个键覆盖三条不同的翻译路径：字母 A、OEM 分号 0xBA、OEM 斜杠 0xBF。
+    // 敲一个真词而不是几个孤立的键：`ipconfig` 里 C/N/F/G 的扫描码是
+    // 0x2E/0x31/0x21/0x22，全都 ≥0x20——正是「扫描码被当成 UTF-16 码元」
+    // 那条缺陷会写出 `.1!"` 的位置。整词写对，才说明键盘路径真的通了。
     let mut sent = 0;
-    for vk in [0x41u16, 0xba, 0xbf] {
+    for vk in "ipconfig".chars().map(probe_vk_for).chain([0xba_u16, 0xbf]) {
         if send_input(&[key_input(vk, false), key_input(vk, true)]) == 2 {
             sent += 1;
         }
     }
-    note(Phase::RealType, &format!("真实按键 vk_sent={sent}/3"));
+    note(Phase::RealType, &format!("真实按键 vk_sent={sent}"));
     sent
+}
+
+/// 探针用的字符 → 虚拟键（只覆盖小写字母与空格；够表达自检词）。
+fn probe_vk_for(ch: char) -> u16 {
+    match ch.to_ascii_uppercase() {
+        c @ 'A'..='Z' => c as u16,
+        ' ' => 0x20,
+        _ => 0x41,
+    }
 }
 
 /// 还原：光标回原位、沉回底层、前台还给原窗口。

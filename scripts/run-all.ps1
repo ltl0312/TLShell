@@ -136,6 +136,12 @@ function New-RoundConfig {
     $dir = Join-Path $env:TEMP ("aegis-round-$Round")
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $path = Join-Path $dir 'config.toml'
+    # 隔离持久状态：`state.json` 里存着上一轮的窗口尺寸，会把 config 的
+    # width/height 顶掉（真踩过：BMP 尺寸检查读到 1024x730）。每轮给应用
+    # 一个干净的 %APPDATA%，本轮参数才真的决定几何。
+    $appData = Join-Path $dir 'appdata'
+    New-Item -ItemType Directory -Force -Path (Join-Path $appData 'TLShell') | Out-Null
+    $env:APPDATA = $appData
     $opacity = [math]::Round(0.80 + 0.02 * $Round, 2)
     $padding = 6 + 2 * $Round
     $radius = 4 + 2 * $Round
@@ -524,6 +530,9 @@ function Invoke-LayerE {
             '真实点击拿到焦点' = '点击取焦点: foreground=true focus_set=true keyboard_ready=true'
             '真实拖选出选区'   = '扩展选择 -> line=\d+ col=\d+ 选区=Some'
             '真实按键写进 PTY' = '真实输入结算: 点击=\d+ 按键=[1-9]\d* 写入 PTY=[1-9]\d* 字节'
+            # 敲的是真词 ipconfig：C/N/F/G 的扫描码 0x2E/0x31/0x21/0x22 全都 ≥0x20。
+            # 八个字节必须按顺序出现，才说明「扫描码被当成 UTF-16 码元」的缺陷没复发。
+            '真实按键敲出 ipconfig' = '(?s)自检写入 1 字节: \[105\].*?\[112\].*?\[99\].*?\[111\].*?\[110\].*?\[102\].*?\[105\].*?\[103\]'
             '前台已归还'       = '前台已还给|没有可归还的前台'
         }
         foreach ($name in $checks.Keys) {
