@@ -8,9 +8,10 @@
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use crate::config::ColorsConfig;
-use crate::win::window::parse_color;
+use crate::win::window::parse_rgb;
 
-/// 打包成 `0x00RRGGBB`，与 softbuffer 的缓冲格式一致。
+/// 打包成 `0x00RRGGBB`，与 DIB 的 `0xAARRGGBB` 存储格式共用同一条装配路径
+/// （alpha 由 `surface::apply_round_mask` 在推送前补上）。
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
@@ -21,7 +22,13 @@ pub struct Theme {
     pub foreground: u32,
     pub cursor: u32,
     pub selection: u32,
+    /// 选区下沿的强调色：白壁纸下选区底色本身分不出层次，靠这条线兜底（V-38）。
+    pub selection_edge: u32,
     pub focus_ring: u32,
+    /// 提权态常驻标记色。
+    ///
+    /// 不开放配置：管理员态是安全线索，不该被用户调成接近背景的颜色而消失（S-01）。
+    pub elevated: u32,
     /// 顺序与 `NamedColor` 的 0..=15 一致。
     pub ansi: [u32; 16],
 }
@@ -30,11 +37,15 @@ impl Theme {
     pub fn from_config(colors: &ColorsConfig) -> Self {
         let fallback = Self::default();
         Self {
-            background: parse_color(&colors.background).unwrap_or(fallback.background),
-            foreground: parse_color(&colors.foreground).unwrap_or(fallback.foreground),
-            cursor: parse_color(&colors.cursor).unwrap_or(fallback.cursor),
-            selection: parse_color(&colors.selection).unwrap_or(fallback.selection),
-            focus_ring: parse_color(&colors.focus_ring).unwrap_or(fallback.focus_ring),
+            background: parse_rgb(&colors.background).unwrap_or(fallback.background),
+            foreground: parse_rgb(&colors.foreground).unwrap_or(fallback.foreground),
+            cursor: parse_rgb(&colors.cursor).unwrap_or(fallback.cursor),
+            selection: parse_rgb(&colors.selection).unwrap_or(fallback.selection),
+            // 强调色复用 `focus_ring`（配置里的 accent），不新增配置项：
+            // 它已经要为「有焦点」保证对比度，正好也满足「选区在任何壁纸上都看得见」。
+            selection_edge: parse_rgb(&colors.focus_ring).unwrap_or(fallback.selection_edge),
+            focus_ring: parse_rgb(&colors.focus_ring).unwrap_or(fallback.focus_ring),
+            elevated: fallback.elevated,
             ansi: fallback.ansi,
         }
     }
@@ -101,7 +112,10 @@ impl Default for Theme {
             foreground: 0x00cdd6f4,
             cursor: 0x00f5e0dc,
             selection: 0x00585b70,
+            selection_edge: 0x0089b4fa,
             focus_ring: 0x0089b4fa,
+            // Catppuccin yellow：与背景 #1e1e2e 的对比度 11.9:1，任何壁纸上都在。
+            elevated: 0x00f9e2af,
             ansi: [
                 0x006c7086, // 0 black（由 #45475a 提亮，保证可读）
                 0x00f38ba8, // 1 red
@@ -209,6 +223,19 @@ mod tests {
     }
 
     #[test]
+    fn theme_colors_are_in_rrggbb_order() {
+        // 这里错了整窗颜色会通道颠倒（蓝灰变棕灰）：绘制路径必须是 0x00RRGGBB。
+        let colors = ColorsConfig {
+            background: "#1e1e2e".to_owned(),
+            selection: "#585b70".to_owned(),
+            ..ColorsConfig::default()
+        };
+        let theme = Theme::from_config(&colors);
+        assert_eq!(theme.background, 0x001E_1E2E);
+        assert_eq!(theme.selection, 0x0058_5B70);
+    }
+
+    #[test]
     fn invalid_color_falls_back_to_default() {
         let colors = ColorsConfig {
             background: "not-a-color".to_owned(),
@@ -216,5 +243,68 @@ mod tests {
         };
         let theme = Theme::from_config(&colors);
         assert_eq!(theme.background, Theme::default().background);
+    }
+
+    /// 把半透明窗口色合成到给定壁纸上（整窗 alpha 走 `UpdateLayeredWindow`）。
+    fn composite(color: u32, opacity: f64, wallpaper: u32) -> u32 {
+        let channel = |shift: u32| -> u32 {
+            let src = (color >> shift) & 0xFF;
+            let dst = (wallpaper >> shift) & 0xFF;
+            let value = f64::from(src) * opacity + f64::from(dst) * (1.0 - opacity);
+            (value.round() as u32).min(255) << shift
+        };
+        channel(16) | channel(8) | channel(0)
+    }
+
+    /// WCAG 相对亮度。
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| -> f64 {
+            let value = ((color >> shift) & 0xFF) as f64 / 255.0;
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn selection_edge_stays_visible_on_any_wallpaper() {
+        // V-38：0.88 透明度下，选区**底色**在白壁纸与深壁纸上会被挤进同一个亮度区间，
+        // 单靠它是无解的（这正是当初记录下来的结论）。强调色下沿是形状线索，
+        // 必须对两种极端壁纸都达到 3:1。
+        let theme = Theme::default();
+        // 0.70 是 UI 规范里的可读性下限；更低的透明度下连正文都读不了，
+        // 那不是选区的问题，所以只在下限及以上做保证。
+        for opacity in [0.88, 0.70] {
+            for wallpaper in [0x00FF_FFFFu32, 0x0000_0000] {
+                let background = composite(theme.background, opacity, wallpaper);
+                let edge = composite(theme.selection_edge, opacity, wallpaper);
+                let ratio = contrast(edge, background);
+                assert!(
+                    ratio >= 3.0,
+                    "opacity={opacity} wallpaper=0x{wallpaper:06X}: 选区下沿对比度只有 {ratio:.2}:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_selection_fill_alone_splits_the_extremes_badly() {
+        // 反证：同一组条件下，纯底色填充不可能两端都达标——这是选「加下沿」的理由。
+        let theme = Theme::default();
+        let white = composite(theme.background, 0.88, 0x00FF_FFFF);
+        let fill = composite(theme.selection, 0.88, 0x00FF_FFFF);
+        assert!(
+            contrast(fill, white) < 3.0,
+            "如果纯底色已经达标，这条兜底就不需要了"
+        );
     }
 }

@@ -6,23 +6,29 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 默认只读：CI 不需要写仓库，也不该能写。
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
   gate:
-    name: windows / fmt + clippy + test + release
+    name: windows / fmt + clippy + test + deny + release
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 不把 GITHUB_TOKEN 塞进 .git/config：后续步骤没有推送需求。
+          persist-credentials: false
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # 与 rust-toolchain.toml 保持一致；显式指定才能保证 clippy/rustfmt
-          # 装在这个版本上，而不是默认的 stable。
+          # 与 rust-toolchain.toml / Cargo.toml 的 rust-version 三处同源。
           toolchain: "1.97.1"
           components: clippy, rustfmt
 
@@ -30,6 +36,35 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: secret scan
+        shell: pwsh
+        run: |
+          # 不引第三方 action，避免多一个未钉版本的执行面：
+          # 只扫工作区里被 git 跟踪的文本文件，命中常见凭据前缀即失败。
+          $patterns = @(
+            'AKIA[0-9A-Z]{16}',
+            '-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----',
+            'gh[pousr]_[0-9A-Za-z]{30,}',
+            'sk-[A-Za-z0-9]{20,}',
+            'xox[baprs]-[0-9A-Za-z-]{10,}',
+            'eyJhbGciOi[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+          )
+          $files = git ls-files | Where-Object { $_ -notmatch '^(target/|Cargo\.lock$)' }
+          $hits = @()
+          foreach ($f in $files) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+            $text = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue
+            if ($null -eq $text) { continue }
+            foreach ($p in $patterns) {
+              if ($text -match $p) { $hits += "$f :: $p" }
+            }
+          }
+          if ($hits.Count -gt 0) {
+            $hits | ForEach-Object { Write-Host "::error::疑似凭据 $_" }
+            exit 1
+          }
+          Write-Host "secret scan: $($files.Count) 个文件，未命中"
 
       - name: fmt
         run: cargo fmt --all --check

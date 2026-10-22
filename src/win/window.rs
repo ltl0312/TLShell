@@ -195,17 +195,27 @@ pub unsafe fn default_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 }
 
 /// 把 `COLORREF` 从 `#rrggbb` 解析出来。解析失败返回 `None`，由调用方回退默认色。
+#[allow(dead_code)] // 目前没有 GDI 侧的 COLORREF 参数要传；留着给将来画原生控件用。
 pub fn parse_color(text: &str) -> Option<u32> {
+    let rgb = parse_rgb(text)?;
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
+    // COLORREF 是 0x00BBGGRR。
+    Some((b << 16) | (g << 8) | r)
+}
+
+/// 解析 `#RRGGBB`，按 **`0x00RRGGBB`** 返回——这是 DIB 像素与主题色的约定。
+///
+/// 与 [`parse_color`] 的区别只有一个字节序，但用错整窗颜色就会通道颠倒：
+/// 蓝灰主题会渲染成棕灰。绘制路径（painter → DIB）必须用这个，
+/// 只有真的要交给 GDI 的 `COLORREF` 参数才用 `parse_color`。
+pub fn parse_rgb(text: &str) -> Option<u32> {
     let hex = text.trim().trim_start_matches('#');
     if hex.len() != 6 {
         return None;
     }
-    let value = u32::from_str_radix(hex, 16).ok()?;
-    let r = (value >> 16) & 0xFF;
-    let g = (value >> 8) & 0xFF;
-    let b = value & 0xFF;
-    // COLORREF 是 0x00BBGGRR。
-    Some((b << 16) | (g << 8) | r)
+    u32::from_str_radix(hex, 16).ok()
 }
 
 /// `WM_ERASEBKGND` 返回 1：所有像素都由我们绘制，不需要系统擦背景。
@@ -235,6 +245,14 @@ mod tests {
         // #1e1e2e → COLORREF 0x002E1E1E
         assert_eq!(parse_color("#1e1e2e"), Some(0x002E_1E1E));
         assert_eq!(parse_color("1e1e2e"), Some(0x002E_1E1E));
+    }
+
+    #[test]
+    fn parse_rgb_keeps_rrggbb_order() {
+        // 绘制路径的约定（DIB 里 0x00RRGGBB）：#585b70 → 0x00585B70。
+        assert_eq!(parse_rgb("#585b70"), Some(0x0058_5B70));
+        assert_eq!(parse_rgb("89b4fa"), Some(0x0089_B4FA));
+        assert_eq!(parse_rgb("#12345"), None);
     }
 
     #[test]

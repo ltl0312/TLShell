@@ -82,9 +82,12 @@ impl State {
     }
 }
 
-/// `%APPDATA%\TLShell\state.json`。
-pub fn state_path() -> PathBuf {
-    crate::config::config_dir().join("state.json")
+/// `%APPDATA%\TLShell\state.json`。配置目录不可定位时返回 `None`——
+/// 宁可不记住窗口位置，也不要写进一个碰巧的当前目录。
+pub fn state_path() -> Option<PathBuf> {
+    crate::config::config_dir()
+        .ok()
+        .map(|dir| dir.join("state.json"))
 }
 
 /// 读取状态。文件缺失、损坏、版本不匹配都返回 `None`，由调用方回退到配置里的默认值。

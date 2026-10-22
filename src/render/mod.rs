@@ -5,6 +5,7 @@ pub mod glyph;
 pub mod layout;
 pub mod metrics;
 pub mod painter;
+pub mod settings;
 pub mod theme;
 
 pub use cursor::Blink;

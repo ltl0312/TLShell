@@ -8,9 +8,10 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::diag;
+use crate::win::dpi;
 use crate::win::hotkey::{self, Hotkey};
+use crate::win::surface::{self, Surface as LayeredSurface};
 use crate::win::window::{self, WindowSpec};
-use crate::win::{dpi, layered};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
@@ -111,19 +112,31 @@ pub fn run() -> Report {
         format!("GWL_EXSTYLE=0x{ex:08X}（需要 WS_EX_LAYERED=0x00080000）"),
     ));
 
-    // 分层透明度：设置后必须能读回。
-    match layered::set_opacity(hwnd, config.window.opacity) {
-        Ok(()) => {
-            let readback = layered::read_opacity(hwnd);
-            let expected = (config.window.opacity * 255.0).round() as u8;
-            let ok = readback == Some(expected);
+    // 逐像素 alpha：真的走一遍 DIB，确认透明度被折进 alpha 且颜色已预乘。
+    // 不再断言 `SetLayeredWindowAttributes`——那条路和 `UpdateLayeredWindow` 互斥。
+    match LayeredSurface::new(4, 4) {
+        Ok(mut dib) => {
+            {
+                let pixels = dib.pixels_mut();
+                for pixel in pixels.iter_mut() {
+                    *pixel = 0x00FF_FFFF;
+                }
+                surface::apply_round_mask(pixels, 4, 4, 0.0, config.window.opacity);
+            }
+            let pixels = dib.pixels_mut();
+            let expected = (config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let alpha = pixels[0] >> 24;
+            let rgb = pixels[0] & 0x00FF_FFFF;
+            let premultiplied = (expected << 16) | (expected << 8) | expected;
             checks.push(Check::assert(
-                "layered_alpha_roundtrip",
-                ok,
-                format!("写入 alpha={expected}，读回 {readback:?}"),
+                "dib_alpha_roundtrip",
+                alpha == expected && rgb == premultiplied,
+                format!(
+                    "期望 alpha={expected}、预乘 rgb=0x{premultiplied:06X}，实际 alpha={alpha}、rgb=0x{rgb:06X}"
+                ),
             ));
         }
-        Err(err) => checks.push(Check::fail("layered_alpha_roundtrip", format!("{err:#}"))),
+        Err(err) => checks.push(Check::fail("dib_alpha_roundtrip", format!("{err:#}"))),
     }
 
     // 几何：无边框窗口的客户区必须等于请求尺寸。
@@ -156,6 +169,16 @@ pub fn run() -> Report {
         "dpi_query",
         window_dpi >= 48,
         format!("GetDpiForWindow={window_dpi}"),
+    ));
+
+    // 输入法结果串：没有组字时必须返回 None，而不是 panic 或读出垃圾。
+    // 这条只证明 ImmGetCompositionStringW(GCS_RESULTSTR) 的调用路径不崩；
+    // 真机上屏仍要靠真人敲一次输入法（见 README「已知限制」）。
+    let ime = crate::win::ime::result_string(hwnd);
+    checks.push(Check::assert(
+        "ime_result_absent",
+        ime.is_none(),
+        format!("GCS_RESULTSTR -> {ime:?}"),
     ));
 
     // 热键：能解析、能注册、能注销。

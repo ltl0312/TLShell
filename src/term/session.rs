@@ -6,6 +6,7 @@
 //! 生命周期（安全评审 P0-6）：子进程被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object，
 //! 因此 TLShell 被强杀时 shell 不会变成孤儿。
 
+use std::ffi::OsString;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -83,7 +84,10 @@ pub struct SpawnOptions {
     pub rows: u16,
     pub pixel_width: u16,
     pub pixel_height: u16,
-    pub cwd: Option<PathBuf>,
+    /// 已校验过的启动目录（见 `shell::resolve_cwd`），不再允许为空。
+    pub cwd: PathBuf,
+    /// 已过滤的子进程环境（见 `shell::child_env`），父环境不整体继承。
+    pub env: Vec<(OsString, OsString)>,
 }
 
 /// 一个活着的 PTY 会话。
@@ -111,8 +115,12 @@ impl Session {
 
         let mut command = CommandBuilder::new(&options.shell.program);
         command.args(&options.shell.args);
-        if let Some(cwd) = &options.cwd {
-            command.cwd(cwd);
+        command.cwd(&options.cwd);
+        // 先清空再逐项写入：继承父环境会把凭据、令牌、各类 *_proxy
+        // 和 NODE_OPTIONS 之类的注入点原样交给子进程（S-03）。
+        command.env_clear();
+        for (key, value) in &options.env {
+            command.env(key, value);
         }
         // 显式设置 TERM，避免某些程序按 dumb 终端降级。
         command.env("TERM", "xterm-256color");

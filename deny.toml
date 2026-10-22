@@ -7,7 +7,10 @@ targets = [{ triple = "x86_64-pc-windows-msvc" }]
 
 [advisories]
 version = 2
-yanked = "warn"
+# 被 yank 的版本不允许留在依赖图里：yank 通常意味着它不该再被解析到。
+yanked = "deny"
+# 无维护者的 crate 至少要在工作区依赖里报出来（传递依赖用 all 太吵）。
+unmaintained = "workspace"
 ignore = []
 
 [licenses]

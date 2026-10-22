@@ -8,22 +8,29 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub mod state;
 
-/// 配置目录 `%APPDATA%\TLShell`。取不到 `APPDATA` 时退回当前目录，至少不会崩。
-pub fn config_dir() -> PathBuf {
-    match std::env::var_os("APPDATA") {
-        Some(appdata) if !appdata.is_empty() => PathBuf::from(appdata).join("TLShell"),
-        _ => PathBuf::from("."),
+/// 配置目录 `%APPDATA%\TLShell`。
+///
+/// 取不到 `APPDATA` 时**直接失败**：以前会退回当前目录，那会让程序把配置、
+/// state.json、hwnd.txt 写进它碰巧被启动的那个目录（安全评审 F-03）。
+pub fn config_dir() -> Result<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .context("APPDATA 缺失：拒绝把当前目录当作配置目录")?;
+    let dir = PathBuf::from(appdata);
+    if !dir.is_absolute() {
+        bail!("APPDATA 不是绝对路径: {}", dir.display());
     }
+    Ok(dir.join("TLShell"))
 }
 
 /// 配置文件路径 `%APPDATA%\TLShell\config.toml`。
-pub fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
+pub fn config_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("config.toml"))
 }
 
 /// 一次加载的结果：配置本身、实际使用的路径、以及所有告警。
@@ -52,7 +59,18 @@ impl Loaded {
 /// - 文件不存在 → 写一份带注释的默认配置，返回默认值。
 /// - 文件损坏 → 返回默认值 + 告警，**不覆盖**用户的文件（他可能只是想手改）。
 pub fn load(explicit: Option<&Path>) -> Loaded {
-    let path = explicit.map(Path::to_path_buf).unwrap_or_else(config_path);
+    let path = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => match config_path() {
+            Ok(path) => path,
+            Err(err) => {
+                // 配置目录都定位不到时只返回默认值：不写文件、不改任何磁盘状态。
+                let mut loaded = Loaded::from_defaults(PathBuf::new());
+                loaded.warnings.push(format!("{err:#}"));
+                return loaded;
+            }
+        },
+    };
     let mut loaded = Loaded::from_defaults(path.clone());
 
     if !path.exists() {
@@ -89,6 +107,27 @@ pub fn load(explicit: Option<&Path>) -> Loaded {
     loaded
 }
 
+/// 把配置写回文件：先进 `.tmp` 再 `rename`，中途断电不会留下半个文件。
+///
+/// 面板保存与手改文件走的是同一份结构，所以这里保留所有字段（`toml::to_string`
+/// 序列化整个 `Config`），只是丢掉注释——注释在 `write_default` 生成的模板里。
+pub fn save_atomic(config: &Config, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+    let header = "# TLShell 配置（由设置面板写入）
+# 注释版模板见首次生成的默认配置。
+
+";
+    let body = toml::to_string(config).context("序列化配置失败")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, format!("{header}{body}"))
+        .with_context(|| format!("写临时配置失败: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("替换配置失败: {}", path.display()))?;
+    Ok(())
+}
+
 /// 写一份默认配置，字段顺序与注释对齐计划书 §6.1。
 pub fn write_default(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -116,6 +155,9 @@ y = {y}
 opacity = {opacity}
 padding = {padding}
 border_radius = {border_radius}
+# 失焦后沉到所有窗口之下（桌面层模式）。默认 false：普通 z-order，点得到也打得进。
+# 打开后窗口会跑到最大化窗口下面，只能用 Ctrl+Alt+T 叫回来。
+sink_when_unfocused = {sink_when_unfocused}
 
 [font]
 family = "{family}"
@@ -134,6 +176,8 @@ focus_ring = "{focus_ring}"
 [keys]
 quit = "{quit}"
 hide = "{hide}"
+# 沉底模式下把窗口叫回前台并取键盘焦点。
+raise = "{raise}"
 
 [security]
 # OSC 52：允许程序写系统剪贴板。默认关闭。
@@ -151,6 +195,7 @@ paste_guard = {paste_guard}
         opacity = defaults.window.opacity,
         padding = defaults.window.padding,
         border_radius = defaults.window.border_radius,
+        sink_when_unfocused = defaults.window.sink_when_unfocused,
         family = defaults.font.family,
         size = defaults.font.size,
         line_height = defaults.font.line_height,
@@ -161,6 +206,7 @@ paste_guard = {paste_guard}
         focus_ring = defaults.colors.focus_ring,
         quit = defaults.keys.quit,
         hide = defaults.keys.hide,
+        raise = defaults.keys.raise,
         osc52 = defaults.security.osc52,
         allow_custom_shell = defaults.security.allow_custom_shell,
         paste_guard = defaults.security.paste_guard,
@@ -169,7 +215,6 @@ paste_guard = {paste_guard}
 }
 
 /// 透明度低于该值时正文对比度会掉到不可读区间，仅告警不拒绝。
-#[allow(dead_code)] // M4 接入玻璃外观时用于启动告警
 pub const OPACITY_WARN_BELOW: f64 = 0.70;
 /// 透明度硬下界。计划书 §9 M4-② 要求 0.5 仍能明显变透，因此下界不能抬到 0.75。
 pub const OPACITY_MIN: f64 = 0.10;
@@ -212,6 +257,12 @@ pub struct WindowConfig {
     pub opacity: f64,
     pub padding: i32,
     pub border_radius: i32,
+    /// 失焦时把窗口沉到最底层（"桌面层"模式）。
+    ///
+    /// 默认 `false`：沉底的代价是窗口被任何最大化的窗口盖住，鼠标点不到、
+    /// 键盘也进不来——那正是用户报的"无法点击和输入"。想要贴桌面外观的人
+    /// 可以在设置面板里打开它。
+    pub sink_when_unfocused: bool,
 }
 
 impl Default for WindowConfig {
@@ -224,6 +275,7 @@ impl Default for WindowConfig {
             opacity: 0.88,
             padding: 10,
             border_radius: 8,
+            sink_when_unfocused: false,
         }
     }
 }
@@ -277,6 +329,8 @@ impl Default for ColorsConfig {
 pub struct KeysConfig {
     pub quit: String,
     pub hide: String,
+    /// 把窗口提到最前并交给它键盘焦点。
+    pub raise: String,
 }
 
 impl Default for KeysConfig {
@@ -284,6 +338,7 @@ impl Default for KeysConfig {
         Self {
             quit: "Ctrl+Alt+Q".to_owned(),
             hide: "Ctrl+Alt+H".to_owned(),
+            raise: "Ctrl+Alt+T".to_owned(),
         }
     }
 }
@@ -358,6 +413,34 @@ mod tests {
         assert_eq!(cfg.colors.foreground, "#cdd6f4");
         assert_eq!(cfg.colors.cursor, "#f5e0dc");
         assert_eq!(cfg.keys.quit, "Ctrl+Alt+Q");
+    }
+
+    #[test]
+    fn default_template_round_trips_into_defaults() {
+        // 模板里少写一个键，用户拿到的默认配置就和程序默认值不一致；
+        // 模板里写错一个键名，serde 会静默忽略，更难发现。这条测试两头都堵。
+        let dir = std::env::temp_dir().join(format!("tlshell-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_default(&path).unwrap();
+        let loaded = load(Some(&path));
+        assert!(
+            loaded.warnings.is_empty(),
+            "模板本身读不回来: {:?}",
+            loaded.warnings
+        );
+        assert!(!loaded.created, "模板已存在，不该再被重写");
+        let d = Config::default();
+        assert_eq!(
+            loaded.config.window.sink_when_unfocused,
+            d.window.sink_when_unfocused
+        );
+        assert_eq!(loaded.config.keys.raise, d.keys.raise);
+        assert_eq!(loaded.config.window.opacity, d.window.opacity);
+        assert_eq!(loaded.config.security.paste_guard, d.security.paste_guard);
+        assert_eq!(loaded.config.font.family, d.font.family);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

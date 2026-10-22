@@ -2,8 +2,8 @@
 name = "tlshell"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
-description = "TLShell — 挂在 Windows 桌面层（WorkerW）的常驻终端"
+rust-version = "1.97"
+description = "TLShell — 常驻桌面层（顶层沉底）的 Windows 终端"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -12,10 +12,8 @@ alacritty_terminal = { version = "=0.26.0", default-features = false }
 anyhow = "=1.0.104"
 fontdue = "=0.9.5"
 portable-pty = "=0.9.0"
-raw-window-handle = "=0.6.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-softbuffer = "=0.4.8"
 toml = "=1.1.8"
 
 [dependencies.windows]

@@ -29,9 +29,19 @@ struct Options {
     selftest: bool,
     report: Option<PathBuf>,
     quit: bool,
+    /// 当前以管理员权限运行时，用非提权方式重启自己。
+    restart_unelevated: bool,
     config_path: Option<PathBuf>,
     /// 忽略 `state.json`，回到配置里的默认位置。
     reset_position: bool,
+    /// 真机输入自检：启动后由本进程自己注入一次点击与一次按键。
+    probe_input: bool,
+    /// `--probe-real`：用 `SendInput` 产生真实鼠标/键盘事件（带前台守卫）。
+    probe_real: bool,
+    /// 把首帧绘制面落盘成 BMP（视觉验收取证用）。
+    dump_frame: Option<std::path::PathBuf>,
+    /// 落盘时的合成底色（`RRGGBB`）。白底是最差条件，黑底是另一种极端。
+    dump_bg: Option<u32>,
 }
 
 fn main() -> ExitCode {
@@ -42,8 +52,16 @@ fn main() -> ExitCode {
 
     diag::init();
 
+    // 环境前置校验（安全评审 F-03 / F-05）：配置目录与用户目录拿不到时显式失败。
+    // 从前会退化到「当前目录」，那会让程序在被启动的任意目录里写配置和状态文件。
+    if !options.selftest && !options.quit && !options.restart_unelevated {
+        if let Err(err) = preflight_environment() {
+            return fail(&format!("运行环境不可用: {err:#}"));
+        }
+    }
+
     // 单实例锁必须活到进程结束，所以绑在 main 里而不是 run_normal 里。
-    let _instance = if options.selftest || options.quit {
+    let _instance = if options.selftest || options.quit || options.restart_unelevated {
         None
     } else {
         match win::single::ensure_single() {
@@ -51,13 +69,15 @@ fn main() -> ExitCode {
             Err(err) => return fail(&format!("单实例检测失败: {err:#}")),
         }
     };
-    if _instance.is_none() && !options.selftest && !options.quit {
+    if _instance.is_none() && !options.selftest && !options.quit && !options.restart_unelevated {
         // 已有实例在跑：唤醒它之后安静退出，不算错误。
         return ExitCode::SUCCESS;
     }
 
     let result = if options.selftest {
         run_selftest(&options)
+    } else if options.restart_unelevated {
+        run_restart_unelevated()
     } else if options.quit {
         run_quit_request()
     } else {
@@ -70,6 +90,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// 启动前的环境前置校验：缺一个就明确失败，不做任何退化。
+fn preflight_environment() -> Result<()> {
+    config::config_dir()?;
+    let has_profile = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if !has_profile {
+        anyhow::bail!("USERPROFILE 缺失：无法确定 shell 的启动目录");
+    }
+    Ok(())
+}
+
 fn fail(message: &str) -> ExitCode {
     diag::error(message);
     // 无控制台时用弹窗保证用户能看到致命错误，而不是静默什么都不发生。
@@ -78,6 +110,13 @@ fn fail(message: &str) -> ExitCode {
 }
 
 fn show_fatal(message: &str) {
+    // 无人值守环境（测试执行器、CI）不能弹窗：模态对话框会一直挂在那里，
+    // 既挡路又让"启动失败"看起来像"启动成功还在运行"。
+    // 这个变量只抑制弹窗，退出码与日志照旧。
+    if std::env::var_os("TLSHELL_NO_MODAL").is_some() {
+        eprintln!("TLShell 启动失败: {message}");
+        return;
+    }
     use windows::core::HSTRING;
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let text = HSTRING::from(message);
@@ -99,14 +138,56 @@ fn run_normal(options: &Options) -> Result<u8> {
     let config = loaded.config;
 
     let rect = resolve_rect(&config, options.reset_position);
-    let code = app::run(config, Some(rect))?;
+    let code = app::run(
+        config,
+        Some(rect),
+        options.probe_input,
+        options.probe_real,
+        options.dump_frame.clone(),
+        options.dump_bg,
+        options.config_path.clone(),
+    )?;
     Ok(code.clamp(0, 255) as u8)
 }
 
 fn run_quit_request() -> Result<u8> {
-    diag::info("--quit：请求已有实例退出");
-    // 单实例握手在 M5 接入；当前直接以成功码退出，避免脚本误判。
+    if crate::win::single::request_quit() {
+        diag::info("--quit：已请求已有实例退出");
+    } else {
+        // 没有实例不算失败：脚本里 `--quit` 常用来做「先关掉再说」。
+        diag::warn("--quit：没有找到正在运行的实例（或它不是本程序）");
+    }
     Ok(0)
+}
+
+/// 以管理员权限运行时，改用非提权方式重新启动自己。
+///
+/// 做法是让 `explorer.exe` 代启：explorer 跑在普通完整性级别，它拉起来的
+/// 子进程继承中完整性，于是得到一个不带管理员令牌的 TLShell。
+fn run_restart_unelevated() -> Result<u8> {
+    if !crate::win::elevation::is_elevated().unwrap_or(false) {
+        diag::info("--restart-unelevated：当前不是管理员，无需降权重启");
+        return Ok(0);
+    }
+    let exe = std::env::current_exe()?;
+    diag::info(&format!("--restart-unelevated：准备重启 {}", exe.display()));
+    // 先让旧实例退出，否则新进程会被单实例锁挡住。
+    let _ = crate::win::single::request_quit();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let explorer = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("explorer.exe");
+    match std::process::Command::new(&explorer).arg(&exe).spawn() {
+        Ok(_) => {
+            diag::info("--restart-unelevated：已经用非提权方式重新启动");
+            Ok(0)
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "无法通过 {} 重启: {err}",
+            explorer.display()
+        )),
+    }
 }
 
 /// M0 阶段只有默认值；`config.toml` 的加载与校验在 M3 接入。
@@ -125,13 +206,14 @@ fn resolve_rect(config: &Config, reset_position: bool) -> dpi::Rect {
     );
 
     if !reset_position {
-        let path = config::state::state_path();
-        if let Some(state) = config::state::load(&path) {
-            rect = state.window.to_rect();
-            diag::info(&format!(
-                "恢复上次位置: {}x{}@{},{}",
-                rect.w, rect.h, rect.x, rect.y
-            ));
+        if let Some(path) = config::state::state_path() {
+            if let Some(state) = config::state::load(&path) {
+                rect = state.window.to_rect();
+                diag::info(&format!(
+                    "恢复上次位置: {}x{}@{},{}",
+                    rect.w, rect.h, rect.x, rect.y
+                ));
+            }
         }
     }
 
@@ -169,7 +251,29 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
         let arg = pending[index].clone();
         match arg.as_str() {
             "--selftest" => options.selftest = true,
+            "--probe-input" => options.probe_input = true,
+            "--probe-real" => options.probe_real = true,
+            "--dump-frame" => {
+                index += 1;
+                let value = pending
+                    .get(index)
+                    .cloned()
+                    .context("--dump-frame 需要一个路径参数")?;
+                options.dump_frame = Some(PathBuf::from(value));
+            }
+            "--dump-bg" => {
+                index += 1;
+                let value = pending
+                    .get(index)
+                    .cloned()
+                    .context("--dump-bg 需要一个 RRGGBB 底色（如 000000）")?;
+                options.dump_bg = Some(
+                    crate::win::window::parse_rgb(&value)
+                        .with_context(|| format!("--dump-bg 不是 RRGGBB：{value}"))?,
+                );
+            }
             "--quit" => options.quit = true,
+            "--restart-unelevated" => options.restart_unelevated = true,
             "--reset-position" => options.reset_position = true,
             "--report" => {
                 index += 1;
@@ -190,7 +294,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
             "--help" | "-h" => {
                 pending.clear();
                 return Err(anyhow::anyhow!(
-                    "用法: TLShell.exe [--config <PATH>] [--quit] [--selftest [--report <PATH>]]"
+                    "用法: TLShell.exe [--config <PATH>] [--quit] [--probe-input] [--selftest [--report <PATH>]]"
                 ));
             }
             other => {
