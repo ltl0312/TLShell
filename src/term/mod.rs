@@ -2,6 +2,7 @@
 
 pub mod grid;
 pub mod input;
+pub mod paste;
 pub mod session;
 pub mod shell;
 

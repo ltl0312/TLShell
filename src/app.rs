@@ -43,11 +43,12 @@ use crate::config::Config;
 use crate::diag;
 use crate::render::{Blink, FontSet, Layout, Painter, Theme};
 use crate::term::input::{self, Key, Modifiers};
+use crate::term::paste;
 use crate::term::session::{Session, SpawnOptions};
 use crate::term::{shell, TermSize, Terminal};
 use crate::win::hotkey::{self, Hotkey};
 use crate::win::window::{self, WindowSpec};
-use crate::win::{clipboard, dpi, layered, single};
+use crate::win::{clipboard, dpi, elevation, layered, single};
 
 pub mod selftest;
 
@@ -62,6 +63,15 @@ const TIMER_TICK: usize = 1;
 const TICK_MS: u32 = 16;
 /// 两次实际重绘之间的最小间隔，避免高频输出把 CPU 打满。
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// 底部提示条（粘贴确认、告警）的存活时间。
+const OVERLAY_TTL: Duration = Duration::from_secs(3);
+
+/// 多行粘贴的二次确认窗口：超过这个时间再按 Ctrl+V 会重新提示。
+const PASTE_CONFIRM_TTL: Duration = Duration::from_secs(3);
+
+/// 启动告警（管理员终端、热键失败）留得久一点。
+const ADMIN_NOTICE_TTL: Duration = Duration::from_secs(30);
 
 /// 边缘拖拽缩放的命中宽度（物理像素）。
 const RESIZE_BAND: i32 = 5;
@@ -121,6 +131,11 @@ pub struct App {
     last_render: Instant,
     /// `WM_KEYDOWN` 已经处理过的键，抑制随后那条重复的 `WM_CHAR`。
     suppress_next_char: bool,
+    /// 底部提示条（粘贴确认、配置告警），到点自动消失。
+    overlay: Option<(String, Instant)>,
+    /// 提示条到期时刻（`Instant` 是该条消失的时间点）。
+    /// 待确认的多行粘贴内容与首次按键时间。
+    pending_paste: Option<(String, Instant)>,
     /// 实际使用的配置文件路径（`--config` 可覆盖）。
     config_path: std::path::PathBuf,
     /// 上次看到的配置文件修改时间，用于热重载判定。
@@ -166,6 +181,8 @@ impl App {
             dirty: false,
             last_render: Instant::now(),
             suppress_next_char: false,
+            overlay: None,
+            pending_paste: None,
             config_path: crate::config::config_path(),
             config_mtime: None,
             last_watch: Instant::now(),
@@ -240,6 +257,7 @@ impl App {
         self.ensure_surface(hwnd)?;
         self.reload_fonts(hwnd)?;
         self.apply_size(hwnd)?;
+        self.report_startup_warnings();
         self.spawn_session(hwnd)?;
         // SAFETY: hwnd 有效；定时器在 WM_DESTROY 里注销。
         unsafe {
@@ -730,6 +748,11 @@ impl App {
                 return;
             }
         }
+        // Ctrl+V 走剪贴板净化 + 多行确认 + bracketed paste 三条前置。
+        if mods.ctrl && !mods.alt && matches!(key, Key::Char('v') | Key::Char('V')) {
+            self.paste_from_clipboard();
+            return;
+        }
         let mode = self
             .terminal
             .as_ref()
@@ -761,11 +784,111 @@ impl App {
 
     // ---------------------------------------------------------------- 定时
 
+    /// 启动阶段的告警走底部提示条露出来。
+    ///
+    /// 没有标题栏、没有托盘、没有控制台，热键注册失败和挂载降级如果只写日志，
+    /// 用户永远不知道（UI 规范 G5/G6）。这里把最关键的一条摆到画面上。
+    fn report_startup_warnings(&mut self) {
+        match elevation::is_elevated() {
+            Ok(true) => {
+                diag::warn("进程以管理员权限运行：从管理员 shell 启动会继承高完整性级别");
+                self.set_overlay_for(
+                    "以管理员权限运行：此窗口里的操作会改动系统",
+                    ADMIN_NOTICE_TTL,
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => diag::warn(&format!("提权状态自检失败: {err}")),
+        }
+        if let Some(first) = self.hotkey_warnings.first() {
+            let text = format!("启动告警：{first}");
+            self.set_overlay_for(text, ADMIN_NOTICE_TTL);
+        }
+    }
+
+    /// 显示一条底部提示，`OVERLAY_TTL` 后自动消失。
+    fn set_overlay(&mut self, text: impl Into<String>) {
+        self.set_overlay_for(text, OVERLAY_TTL);
+    }
+
+    /// 显示一条存活 `ttl` 的提示（管理员提示这类需要更久的用这个）。
+    fn set_overlay_for(&mut self, text: impl Into<String>, ttl: Duration) {
+        self.overlay = Some((text.into(), Instant::now() + ttl));
+        self.dirty = true;
+    }
+
+    /// 粘贴剪贴板内容。
+    ///
+    /// 三道闸门（计划书 §5.5 与安全评审 P0-4）：
+    /// 1. 净化：只留可打印字符与换行/制表符，控制字符一律丢弃；
+    /// 2. 多行确认：`paste_guard` 打开时，含多行的内容需要 3 秒内再按一次；
+    /// 3. bracketed paste：终端支持时用 `ESC[200~ ... ESC[201~` 包住，
+    ///    让 shell 分清「粘贴」与「键入」，避免粘贴即执行。
+    fn paste_from_clipboard(&mut self) {
+        let raw = match clipboard::get_text() {
+            Ok(text) => text,
+            Err(err) => {
+                self.set_overlay(format!("粘贴失败：{err}"));
+                return;
+            }
+        };
+        let clean = paste::sanitize(&raw);
+        if clean.is_empty() {
+            self.set_overlay("剪贴板里没有可粘贴的文本");
+            return;
+        }
+
+        diag::info(&format!(
+            "粘贴请求: {} 字符 {} 行，paste_guard={}",
+            clean.chars().count(),
+            paste::line_count(&clean),
+            self.config.security.paste_guard
+        ));
+        if self.config.security.paste_guard && paste::needs_confirm(&clean) {
+            let now = Instant::now();
+            let approved = self.pending_paste.as_ref().is_some_and(|(text, at)| {
+                text == &clean && now.duration_since(*at) < PASTE_CONFIRM_TTL
+            });
+            if !approved {
+                self.pending_paste = Some((clean.clone(), now));
+                diag::info("多行粘贴：等待二次确认");
+                self.set_overlay(format!(
+                    "剪贴板含 {} 行，3 秒内再按一次 Ctrl+V 确认粘贴",
+                    paste::line_count(&clean)
+                ));
+                return;
+            }
+            self.pending_paste = None;
+        }
+
+        let bracketed = self
+            .terminal
+            .as_ref()
+            .is_some_and(|term| term.mode().contains(TermMode::BRACKETED_PASTE));
+        let bytes = paste::bytes_for_pty(&clean, bracketed);
+        diag::info(&format!("写入粘贴内容 {} 字节", bytes.len()));
+        self.write_to_pty(&bytes);
+        self.overlay = None;
+        self.dirty = true;
+    }
+
     fn tick(&mut self) {
         self.pump_pty();
         self.watch_config();
 
         let now = Instant::now();
+        if let Some((_, until)) = self.overlay {
+            if now >= until {
+                self.overlay = None;
+                self.dirty = true;
+            }
+        }
+        if let Some((_, at)) = &self.pending_paste {
+            if now.duration_since(*at) >= PASTE_CONFIRM_TTL {
+                self.pending_paste = None;
+            }
+        }
         if self.blink.tick(now) {
             self.dirty = true;
         }
@@ -813,12 +936,14 @@ impl App {
                 width: width as usize,
                 height: height as usize,
             };
+            let overlay = self.overlay.as_ref().map(|(text, _)| text.as_str());
             painter.draw(
                 &mut frame,
                 &self.layout,
                 term,
                 self.blink.visible(),
                 self.focused,
+                overlay,
             );
         }
         if let Err(err) = buffer.present() {

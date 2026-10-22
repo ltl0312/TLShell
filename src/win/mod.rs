@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod dpi;
+pub mod elevation;
 pub mod font;
 pub mod hotkey;
 pub mod layered;

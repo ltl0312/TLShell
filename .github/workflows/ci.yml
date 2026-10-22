@@ -19,8 +19,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # 与 rust-toolchain.toml 保持一致；显式指定才能保证 clippy/rustfmt
+          # 装在这个版本上，而不是默认的 stable。
+          toolchain: "1.97.1"
           components: clippy, rustfmt
 
       - name: Cache cargo + target
@@ -36,6 +39,14 @@ jobs:
 
       - name: test
         run: cargo test --locked
+
+      - name: install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: deny (licenses / advisories / sources / bans)
+        run: cargo deny --all-features check
 
       - name: release build
         run: cargo build --locked --release

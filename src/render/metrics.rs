@@ -30,6 +30,29 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "MS Gothic",
 ];
 
+/// 判断一个字符在终端里是否占两格。
+///
+/// 只覆盖实际会用到的宽字符区段（CJK、假名、谚文、全角标点、CJK 扩展 B+）。
+/// 这是给绘制提示条这类“非网格文本”用的；网格里的宽度由 VT 层的 `WIDE_CHAR` 标志给出。
+pub fn is_wide(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(
+        code,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x20000..=0x3FFFD
+    )
+}
+
 /// 单元格尺寸：宽高都取整到物理像素，最小 1。
 pub fn cell_box(advance: f32, size_px: f32, line_height: f32) -> (i32, i32) {
     let width = advance.round() as i32;

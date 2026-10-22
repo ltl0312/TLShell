@@ -6,9 +6,10 @@
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::Foundation::HLOCAL;
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
@@ -83,6 +84,42 @@ unsafe fn write_inner(wide: &[u16], bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// 读取剪贴板文本。非文本内容返回 `Err`，调用方不得把错误当空串处理。
+pub fn get_text() -> Result<String> {
+    // SAFETY: 打开剪贴板；同一个线程内配对调用 CloseClipboard。
+    unsafe {
+        OpenClipboard(None).context("打开剪贴板失败")?;
+    }
+    let result = read_locked();
+    // SAFETY: 与上面的 OpenClipboard 配对。
+    unsafe {
+        let _ = CloseClipboard();
+    }
+    result
+}
+
+/// 调用方必须已经持有剪贴板锁。
+fn read_locked() -> Result<String> {
+    // SAFETY: 剪贴板已加锁，句柄在 CloseClipboard 前有效。
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT) }.context("剪贴板里没有文本")?;
+    if handle.is_invalid() {
+        bail!("剪贴板里没有文本");
+    }
+    // SAFETY: 句柄来自 GetClipboardData(CF_UNICODETEXT)，内容是以 NUL 结尾的 UTF-16。
+    unsafe {
+        let ptr = GlobalLock(HGLOBAL(handle.0)) as *const u16;
+        if ptr.is_null() {
+            bail!("锁定剪贴板内存失败");
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+        let _ = GlobalUnlock(HGLOBAL(handle.0));
+        Ok(text)
+    }
+}
 #[cfg(test)]
 mod tests {
     /// 只验证裁剪逻辑，不碰真实剪贴板——单测不该污染用户的剪贴板。

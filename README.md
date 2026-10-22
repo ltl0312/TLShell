@@ -37,6 +37,21 @@ cargo build --release
 .\tlshell.exe --selftest      # 无界面自检，写 JSON 报告
 ```
 
+## 交互
+
+| 操作 | 行为 |
+|---|---|
+| 拖动内边距 | 移动窗口 |
+| 拖四边/四角 | 缩放（最小 480×240 逻辑像素） |
+| 滚轮 | 回看历史 3 行/格；打字自动回到底部 |
+| 拖选 | 选中文本，`Ctrl+C` 复制（无选区时 `Ctrl+C` 仍是中断） |
+| `Ctrl+V` | 粘贴。剥离 C0/C1 控制字符；含多行时底部提示条要求 3 秒内再按一次确认；终端支持时用 bracketed paste 包裹 |
+| `Ctrl+Alt+Q` | 退出 |
+| `Ctrl+Alt+H` | 隐藏 |
+
+底部提示条（一行，3 秒后消失，启动告警留 30 秒）用于：粘贴确认、剪贴板失败、
+热键注册失败、以管理员权限运行。
+
 ## 已知限制
 
 这些是**设计取舍**，不是缺陷：
@@ -69,6 +84,11 @@ cargo build --release
 - 日志落 `%LOCALAPPDATA%\TLShell\logs\`，默认 `warn` 级别，**不记录** PTY 字节流、键盘输入与剪贴板内容。
 - 子进程放进 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 作业对象：TLShell 退出时 shell 一并结束，不留孤儿进程。
 - 单实例：命名互斥体判重，第二个实例用 `%APPDATA%\TLShell\hwnd.txt` 记的句柄唤醒已有窗口后退出。
+- WorkerW 候选在按类名找到之后，还要用 `GetWindowThreadProcessId` + `QueryFullProcessImageNameW`
+  确认宿主进程是 `explorer.exe`；同完整性级别的进程注册同名类窗口会被拒绝。
+- 提权状态自检：`TokenElevation` 为真时在底部提示条明示「以管理员权限运行」，
+  因为无边框窗口没有任何其它的管理员线索。
+- 依赖许可证与安全公告由 `deny.toml` + CI 的 `cargo deny check` 把关。
 
 ## 文档
 
@@ -77,6 +97,13 @@ cargo build --release
 - 安全架构：`docs/design/2026-10-22-tlshell-security-architecture.md`
 - 视觉验收：`docs/aegis/plans/2026-10-22-tlshell-desktop-terminal-visual-acceptance.md`
 - 构建与 CI：`docs/aegis/plans/2026-10-22-tlshell-build-ci-toolchain.md`
+
+## 视觉验收
+
+43 条视觉验收项（`V-01`…`V-43`）的逐条状态与截图证据见
+[`docs/aegis/evidence/vis/M5/index.md`](docs/aegis/evidence/vis/M5/index.md)。
+其中 `V-19`（圆角抗锯齿）、`V-30`（退出码状态行）、`V-32`（错误显示到界面）
+以及全部对比度/录屏类条目**未通过或未验证**，已在文档中逐条标注。
 
 ## 许可
 

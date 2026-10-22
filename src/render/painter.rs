@@ -11,7 +11,7 @@ use alacritty_terminal::term::TermMode;
 
 use crate::render::glyph::GlyphCache;
 use crate::render::layout::Layout;
-use crate::render::metrics::FontSet;
+use crate::render::metrics::{is_wide, FontSet};
 use crate::render::theme::{blend, Theme};
 use crate::term::Terminal;
 
@@ -103,6 +103,7 @@ impl Painter {
         term: &Terminal,
         cursor_visible: bool,
         focused: bool,
+        overlay: Option<&str>,
     ) {
         frame.clear(self.theme.background);
 
@@ -150,6 +151,9 @@ impl Painter {
             self.draw_cursor(frame, layout, term, display_offset, cursor_visible, focused);
         }
 
+        if let Some(text) = overlay {
+            self.draw_overlay(frame, layout, text);
+        }
         self.draw_border(frame, focused);
     }
 
@@ -304,6 +308,37 @@ impl Painter {
                 x0,
                 y0,
             );
+        }
+    }
+
+    /// 底部一行状态条：粘贴确认、配置告警这类提示都走它。
+    ///
+    /// 用一行高度换可见性，不引入任何额外的窗口或控件。
+    fn draw_overlay(&mut self, frame: &mut Frame<'_>, layout: &Layout, text: &str) {
+        let width = frame.width as i32;
+        // 上移 2px，避免字形底缘与外框叠在一起。
+        let top = (frame.height as i32 - layout.cell_h - 2).max(0);
+        frame.fill_rect(0, top, width, layout.cell_h, self.theme.selection);
+        let mut x = layout.padding;
+        for ch in text.chars() {
+            if x + layout.cell_w > width {
+                break;
+            }
+            self.draw_glyph(
+                frame,
+                layout,
+                ch,
+                Flags::empty(),
+                self.theme.foreground,
+                x,
+                top,
+            );
+            // 宽字符占两格，否则中文提示会挤成一团。
+            x += if is_wide(ch) {
+                layout.cell_w * 2
+            } else {
+                layout.cell_w
+            };
         }
     }
 

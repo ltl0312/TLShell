@@ -62,6 +62,12 @@ pub struct Terminal {
     term: Term<EventProxy>,
     processor: Processor,
     size: TermSize,
+    /// ConPTY 的 Win32 输入模式（`CSI ? 9001 h`）。
+    ///
+    /// 上游 `TermMode` 没有这个标志位（开发者工具实测项 ②），只能自己记。
+    /// 记录它不是为了改键盘编码——我们始终发 VT 序列，实测 PowerShell、
+    /// cmd 与 vim 都工作正常——而是为了让日志能解释“程序为什么要的是另一种输入”。
+    win32_input: bool,
 }
 
 impl Terminal {
@@ -82,6 +88,7 @@ impl Terminal {
                 term,
                 processor,
                 size,
+                win32_input: false,
             },
             rx,
         )
@@ -89,7 +96,31 @@ impl Terminal {
 
     /// 把 PTY 字节喂给 VT 状态机。
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.track_win32_input(bytes);
         self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// 扫一遍 `CSI ? 9001 h/l`，状态变化时记一条日志。
+    ///
+    /// 只在跨块边界时可能漏检（序列被两个读缓冲切开）；漏检的后果只是日志少一条，
+    /// 输入路径不依赖这个标志，所以不做跨块拼接。
+    fn track_win32_input(&mut self, bytes: &[u8]) {
+        const ON: &[u8] = b"[?9001h";
+        const OFF: &[u8] = b"[?9001l";
+        if bytes.windows(ON.len()).any(|window| window == ON) && !self.win32_input {
+            self.win32_input = true;
+            crate::diag::info("ConPTY 切到 Win32 输入模式（?9001h）；本终端继续发送 VT 序列");
+        }
+        if bytes.windows(OFF.len()).any(|window| window == OFF) && self.win32_input {
+            self.win32_input = false;
+            crate::diag::info("ConPTY 退出 Win32 输入模式（?9001l）");
+        }
+    }
+
+    /// 当前是否处于 Win32 输入模式（只用于诊断）。
+    #[allow(dead_code)] // 诊断用，暂未接入 UI
+    pub fn win32_input_mode(&self) -> bool {
+        self.win32_input
     }
 
     pub fn resize(&mut self, size: TermSize) {
@@ -230,6 +261,16 @@ mod tests {
         assert!(cell
             .flags
             .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR));
+    }
+
+    #[test]
+    fn tracks_win32_input_mode_sequences() {
+        let (mut term, _rx) = Terminal::new(TermSize::new(80, 24), 100, Osc52::Disabled);
+        assert!(!term.win32_input_mode());
+        term.feed(b"[?9001h");
+        assert!(term.win32_input_mode());
+        term.feed(b"[?9001l");
+        assert!(!term.win32_input_mode());
     }
 
     #[test]
