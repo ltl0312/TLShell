@@ -19,14 +19,16 @@ use raw_window_handle::{
     RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
 };
 use softbuffer::{Context as SoftContext, Surface};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostQuitMessage,
-    SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, MSG, SW_HIDE, WM_CHAR,
-    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT,
+    HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MSG,
+    SW_HIDE, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
 };
 
 use crate::config::Config;
@@ -52,6 +54,14 @@ const TIMER_TICK: usize = 1;
 const TICK_MS: u32 = 16;
 /// 两次实际重绘之间的最小间隔，避免高频输出把 CPU 打满。
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// 边缘拖拽缩放的命中宽度（物理像素）。
+const RESIZE_BAND: i32 = 5;
+/// 四角拖拽缩放的命中尺寸（物理像素），比边宽一些才好抓。
+const CORNER_BAND: i32 = 16;
+/// 窗口最小尺寸（逻辑像素），来自 UI 规范。
+const MIN_WIDTH: i32 = 480;
+const MIN_HEIGHT: i32 = 240;
 
 /// 把 HWND 包成 raw-window-handle 需要的样子，供 softbuffer 使用。
 #[derive(Clone, Copy)]
@@ -513,6 +523,94 @@ impl App {
         }
     }
 
+    /// 非客户区命中测试。
+    ///
+    /// 窗口没有标题栏，所以拖动与缩放全靠这里：
+    /// - 四角 → 对角缩放；四边 → 单向缩放
+    /// - 内边距那一圈 → 整窗拖动
+    /// - 其余（正文区）→ 交给终端，绝不吃掉点击
+    /// - 按住 Alt 时正文区也可拖动，作为窄内边距下的退路
+    fn hit_test(&self, hwnd: HWND, lparam: LPARAM) -> LRESULT {
+        let screen_x = (lparam.0 & 0xffff) as i16 as i32;
+        let screen_y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+        let mut point = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        // SAFETY: point 是栈上可写结构，hwnd 有效。
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+        let Ok(rect) = window::client_rect(hwnd) else {
+            return LRESULT(HTCLIENT as isize);
+        };
+        let (width, height) = (rect.w, rect.h);
+        if width <= 0 || height <= 0 {
+            return LRESULT(HTCLIENT as isize);
+        }
+
+        let (x, y) = (point.x, point.y);
+        let corner = CORNER_BAND.min(width / 3).min(height / 3);
+        let band = RESIZE_BAND.min(width / 3).min(height / 3).max(1);
+
+        let near_left = x < corner;
+        let near_right = x >= width - corner;
+        let near_top = y < corner;
+        let near_bottom = y >= height - corner;
+
+        // 四角优先，否则内边距那一圈永远够不到对角。
+        let corner_hit = match (near_left, near_right, near_top, near_bottom) {
+            (true, _, true, _) => Some(HTTOPLEFT),
+            (_, true, true, _) => Some(HTTOPRIGHT),
+            (true, _, _, true) => Some(HTBOTTOMLEFT),
+            (_, true, _, true) => Some(HTBOTTOMRIGHT),
+            _ => None,
+        };
+        if let Some(hit) = corner_hit {
+            return LRESULT(hit as isize);
+        }
+
+        if x < band {
+            return LRESULT(HTLEFT as isize);
+        }
+        if x >= width - band {
+            return LRESULT(HTRIGHT as isize);
+        }
+        if y < band {
+            return LRESULT(HTTOP as isize);
+        }
+        if y >= height - band {
+            return LRESULT(HTBOTTOM as isize);
+        }
+
+        // 拖动带至少留 12 物理像素：`padding` 配成 0 时窗口不能变得没法拖。
+        let window_dpi = dpi::window_dpi(hwnd);
+        let padding = dpi::scale(self.config.window.padding, dpi::BASE_DPI, window_dpi).max(12);
+        if x < padding || y < padding || x >= width - padding || y >= height - padding {
+            return LRESULT(HTCAPTION as isize);
+        }
+
+        // 内边距太窄时，Alt + 拖动是备用把手。
+        if current_modifiers().alt {
+            return LRESULT(HTCAPTION as isize);
+        }
+
+        LRESULT(HTCLIENT as isize)
+    }
+
+    /// 限制最小尺寸，避免缩到没法用。
+    fn apply_min_size(&self, hwnd: HWND, lparam: LPARAM) -> LRESULT {
+        let window_dpi = dpi::window_dpi(hwnd);
+        let min_width = dpi::scale(MIN_WIDTH, dpi::BASE_DPI, window_dpi).max(1);
+        let min_height = dpi::scale(MIN_HEIGHT, dpi::BASE_DPI, window_dpi).max(1);
+        // SAFETY: WM_GETMINMAXINFO 的 lparam 指向可写的 MINMAXINFO。
+        let info =
+            unsafe { &mut *(lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO) };
+        info.ptMinTrackSize.x = min_width;
+        info.ptMinTrackSize.y = min_height;
+        LRESULT(0)
+    }
+
     // ---------------------------------------------------------------- 消息
 
     /// 消息分发。返回 `LRESULT`；未处理的消息由调用方转交默认过程。
@@ -521,7 +619,7 @@ impl App {
         hwnd: HWND,
         msg: u32,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Option<LRESULT> {
         match msg {
             WM_CREATE => {
@@ -545,6 +643,8 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(window::ERASE_HANDLED),
+            WM_NCHITTEST => Some(self.hit_test(hwnd, lparam)),
+            WM_GETMINMAXINFO => Some(self.apply_min_size(hwnd, lparam)),
             WM_SIZE => {
                 if let Err(err) = self.apply_size(hwnd) {
                     diag::warn(&format!("尺寸同步失败: {err:#}"));
@@ -745,6 +845,22 @@ pub fn run(config: Config) -> Result<i32> {
 
     let hwnd = window::create(hinstance, &spec, app_ptr)?;
     app.hwnd = hwnd;
+
+    // 顺序很重要：先改父子关系，再设置分层属性。
+    // 反过来做的话，`SetLayeredWindowAttributes` 记录的是“顶层窗口”的分层表面，
+    // 窗口变成子窗口之后不会再被合成，屏幕上就什么都看不到（实测如此）。
+    //
+    // 挂到壁纸层。失败只降级为普通窗口——功能少了，但终端照样能用。
+    match crate::win::workerw::attach(hwnd) {
+        crate::win::workerw::Attach::Attached { workerw, strategy } => {
+            diag::info(&format!("已挂到 WorkerW（{strategy}）: {:?}", workerw.0));
+        }
+        crate::win::workerw::Attach::Fallback { reason } => {
+            diag::warn(&format!("挂桌面层失败，降级为普通窗口: {reason}"));
+            app.hotkey_warnings
+                .push(format!("桌面层挂载失败: {reason}"));
+        }
+    }
 
     layered::set_opacity(hwnd, app.config.window.opacity)?;
     app.register_hotkeys(hwnd);

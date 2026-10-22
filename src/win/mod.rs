@@ -5,3 +5,4 @@ pub mod font;
 pub mod hotkey;
 pub mod layered;
 pub mod window;
+pub mod workerw;
