@@ -11,9 +11,6 @@ use std::ffi::c_void;
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::UpdateWindow;
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HBRUSH, HGDIOBJ, PAINTSTRUCT,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -157,24 +154,6 @@ pub fn dpi(hwnd: HWND) -> u32 {
         crate::win::dpi::BASE_DPI
     } else {
         dpi
-    }
-}
-
-/// M0 阶段的纯色填充：M1 接入渲染层后由 `render::painter` 接管绘制。
-pub fn paint_solid(hwnd: HWND, color: u32) {
-    // SAFETY: 绘制期间 hwnd 有效；画刷用完立即删除。
-    unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        if hdc.is_invalid() {
-            return;
-        }
-        let brush: HBRUSH = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
-        if !brush.is_invalid() {
-            FillRect(hdc, &ps.rcPaint, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-        }
-        let _ = EndPaint(hwnd, &ps);
     }
 }
 

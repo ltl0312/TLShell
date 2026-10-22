@@ -7,6 +7,8 @@
 mod app;
 mod config;
 mod diag;
+mod render;
+mod term;
 mod win;
 
 use std::path::PathBuf;

@@ -5,18 +5,36 @@
 //! - 窗口过程里的一切 panic 都被 `catch_unwind` 拦住，转交 `DefWindowProcW`，
 //!   因为 unwind 穿过 `extern "system"` 边界是未定义行为。
 
-use anyhow::Result;
 use std::ffi::c_void;
+use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+
+use alacritty_terminal::event::Event;
+use alacritty_terminal::term::{Osc52, TermMode};
+use anyhow::{Context, Result};
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+};
+use softbuffer::{Context as SoftContext, Surface};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, PostQuitMessage, ShowWindow,
-    TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, MSG, SW_HIDE, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_HOTKEY, WM_NCCREATE, WM_PAINT,
+    DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostQuitMessage,
+    SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, MSG, SW_HIDE, WM_CHAR,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
 };
 
 use crate::config::Config;
 use crate::diag;
+use crate::render::{Blink, FontSet, Layout, Painter, Theme};
+use crate::term::input::{self, Key, Modifiers};
+use crate::term::session::{Session, SpawnOptions};
+use crate::term::{shell, TermSize, Terminal};
 use crate::win::hotkey::{self, Hotkey};
 use crate::win::window::{self, WindowSpec};
 use crate::win::{dpi, layered};
@@ -28,26 +46,98 @@ pub const HOTKEY_ID_QUIT: i32 = 1;
 /// 隐藏/清屏热键的注册 id。
 pub const HOTKEY_ID_HIDE: i32 = 2;
 
+/// 唯一的定时器 id：同时驱动 PTY 泵与光标闪烁。
+const TIMER_TICK: usize = 1;
+/// 定时器周期。16ms ≈ 60Hz，是“内容驱动重绘”的节流下限。
+const TICK_MS: u32 = 16;
+/// 两次实际重绘之间的最小间隔，避免高频输出把 CPU 打满。
+const RENDER_INTERVAL: Duration = Duration::from_millis(16);
+
+/// 把 HWND 包成 raw-window-handle 需要的样子，供 softbuffer 使用。
+#[derive(Clone, Copy)]
+struct SoftWindow(HWND);
+
+impl HasWindowHandle for SoftWindow {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let Some(raw_hwnd) = std::num::NonZeroIsize::new(self.0 .0 as isize) else {
+            return Err(HandleError::Unavailable);
+        };
+        let handle = Win32WindowHandle::new(raw_hwnd);
+        // SAFETY: 句柄来自真实存在的窗口，且 SoftWindow 不延长其生命周期。
+        unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Win32(handle))) }
+    }
+}
+
+impl HasDisplayHandle for SoftWindow {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        // SAFETY: Windows 的 display handle 没有附加状态，构造一个即可。
+        unsafe {
+            Ok(DisplayHandle::borrow_raw(RawDisplayHandle::Windows(
+                WindowsDisplayHandle::new(),
+            )))
+        }
+    }
+}
+
 pub struct App {
     hwnd: HWND,
     config: Config,
     quit_hotkey: Option<Hotkey>,
     hide_hotkey: Option<Hotkey>,
-    background: u32,
     /// 记录热键注册失败的原因，供自检与日志使用。
     pub hotkey_warnings: Vec<String>,
+
+    /// 自检路径不启动 shell、不建渲染面。
+    headless: bool,
+    terminal: Option<Terminal>,
+    term_events: Option<Receiver<Event>>,
+    session: Option<Session>,
+    painter: Option<Painter>,
+    context: Option<SoftContext<SoftWindow>>,
+    surface: Option<Surface<SoftWindow, SoftWindow>>,
+    surface_size: (u32, u32),
+    layout: Layout,
+    blink: Blink,
+    focused: bool,
+    dirty: bool,
+    last_render: Instant,
+    /// `WM_KEYDOWN` 已经处理过的键，抑制随后那条重复的 `WM_CHAR`。
+    suppress_next_char: bool,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let background = window::parse_color(&config.colors.background).unwrap_or(0x002E_1E1E);
+        Self::build(config, false)
+    }
+
+    /// 自检用：只建窗口，不起 shell。
+    pub fn new_headless(config: Config) -> Self {
+        Self::build(config, true)
+    }
+
+    fn build(config: Config, headless: bool) -> Self {
+        // 初始化失败前的兜底布局：8×18 单元格、10px 内边距。
+        let layout = Layout::compute(8, 18, config.window.padding, 14, 900, 420);
         Self {
             hwnd: HWND::default(),
             config,
             quit_hotkey: None,
             hide_hotkey: None,
-            background,
             hotkey_warnings: Vec::new(),
+            headless,
+            terminal: None,
+            term_events: None,
+            session: None,
+            painter: None,
+            context: None,
+            surface: None,
+            surface_size: (0, 0),
+            layout,
+            blink: Blink::new(),
+            focused: true,
+            dirty: false,
+            last_render: Instant::now(),
+            suppress_next_char: false,
         }
     }
 
@@ -59,11 +149,6 @@ impl App {
     /// 自检路径里窗口先于 `App` 的字段就绪，需要补写一次。
     pub fn set_hwnd(&mut self, hwnd: HWND) {
         self.hwnd = hwnd;
-    }
-
-    #[allow(dead_code)] // M1 起渲染层读取
-    pub fn config(&self) -> &Config {
-        &self.config
     }
 
     /// 注册全局热键。失败只告警：`--quit` 永远是可用的退路。
@@ -101,6 +186,335 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- 初始化
+
+    /// `WM_CREATE` 里做一次性的重量级初始化。
+    fn initialize(&mut self, hwnd: HWND) -> Result<()> {
+        if self.headless {
+            return Ok(());
+        }
+        self.ensure_surface(hwnd)?;
+        self.reload_fonts(hwnd)?;
+        self.apply_size(hwnd)?;
+        self.spawn_session(hwnd)?;
+        // SAFETY: hwnd 有效；定时器在 WM_DESTROY 里注销。
+        unsafe {
+            SetTimer(Some(hwnd), TIMER_TICK, TICK_MS, None);
+        }
+        Ok(())
+    }
+
+    fn ensure_surface(&mut self, hwnd: HWND) -> Result<()> {
+        if self.surface.is_some() {
+            return Ok(());
+        }
+        // 注意：`WM_CREATE` 期间 `App::hwnd` 还没写回（`run` 在 create 返回后才赋值），
+        // 所以这里必须用传入的 hwnd，否则会拿到空句柄。
+        let window = SoftWindow(hwnd);
+        let context = SoftContext::new(window)
+            .map_err(|err| anyhow::anyhow!("softbuffer 上下文创建失败: {err:?}"))?;
+        let surface = Surface::new(&context, window)
+            .map_err(|err| anyhow::anyhow!("softbuffer 绘制面创建失败: {err:?}"))?;
+        self.context = Some(context);
+        self.surface = Some(surface);
+        Ok(())
+    }
+
+    fn reload_fonts(&mut self, hwnd: HWND) -> Result<()> {
+        let window_dpi = dpi::window_dpi(hwnd);
+        let fonts = FontSet::load(&self.config.font, window_dpi)?;
+        diag::info(&format!(
+            "字体就绪: {} / {:?} @ {}px, 单元格 {}x{}",
+            fonts.primary_family, fonts.fallback_family, fonts.ascii_px, fonts.cell_w, fonts.cell_h
+        ));
+        let theme = Theme::from_config(&self.config.colors);
+        self.painter = Some(Painter::new(fonts, theme));
+        Ok(())
+    }
+
+    fn spawn_session(&mut self, hwnd: HWND) -> Result<()> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let resolved =
+            match shell::resolve(&self.config.shell, self.config.security.allow_custom_shell) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    diag::error(&format!("shell 解析失败: {err:#}"));
+                    self.show_terminal_error(&format!("启动 shell 失败: {err}"));
+                    return Ok(());
+                }
+            };
+        diag::info(&format!(
+            "启动 shell: {} {:?}",
+            resolved.program.display(),
+            resolved.args
+        ));
+
+        let options = SpawnOptions {
+            shell: resolved,
+            cols: self.layout.cols as u16,
+            rows: self.layout.rows as u16,
+            pixel_width: (self.layout.cols * self.layout.cell_w as usize).min(u16::MAX as usize)
+                as u16,
+            pixel_height: (self.layout.rows * self.layout.cell_h as usize).min(u16::MAX as usize)
+                as u16,
+            cwd: std::env::var_os("USERPROFILE").map(std::path::PathBuf::from),
+        };
+
+        match Session::spawn(options) {
+            Ok(session) => {
+                diag::info(&format!("shell pid={}", session.pid()));
+                self.session = Some(session);
+            }
+            Err(err) => {
+                diag::error(&format!("PTY 启动失败: {err:#}"));
+                self.show_terminal_error(&format!("启动 shell 失败: {err}"));
+            }
+        }
+        let _ = hwnd;
+        Ok(())
+    }
+
+    /// 把错误写进终端网格本身——比弹窗温和，也不会挡住桌面。
+    fn show_terminal_error(&mut self, message: &str) {
+        let Some(term) = self.terminal.as_mut() else {
+            return;
+        };
+        term.feed(message.replace('\n', "\r\n").as_bytes());
+        term.feed(b"\r\n");
+        self.dirty = true;
+    }
+
+    /// 重新计算布局，并把尺寸同步给绘制面、终端与 PTY。
+    fn apply_size(&mut self, hwnd: HWND) -> Result<()> {
+        let rect = window::client_rect(hwnd).context("读取客户区尺寸失败")?;
+        let (width, height) = (rect.w, rect.h);
+        if width <= 0 || height <= 0 {
+            return Ok(());
+        }
+
+        if let Some(surface) = self.surface.as_mut() {
+            if let (Some(w), Some(h)) = (
+                NonZeroU32::new(width as u32),
+                NonZeroU32::new(height as u32),
+            ) {
+                let _ = surface.resize(w, h);
+                self.surface_size = (width as u32, height as u32);
+            }
+        }
+
+        let Some((cell_w, cell_h, ascent)) = self
+            .painter
+            .as_ref()
+            .map(|p| (p.fonts.cell_w, p.fonts.cell_h, p.fonts.ascent))
+        else {
+            return Ok(());
+        };
+
+        let window_dpi = dpi::window_dpi(hwnd);
+        let padding = dpi::scale(self.config.window.padding, dpi::BASE_DPI, window_dpi);
+        let layout = Layout::compute(cell_w, cell_h, padding, ascent, width, height);
+        self.layout = layout;
+
+        let size = TermSize::new(layout.cols, layout.rows);
+        match self.terminal.as_mut() {
+            Some(term) => term.resize(size),
+            None => {
+                let (term, rx) = Terminal::new(size, 10_000, osc52_mode(&self.config));
+                self.terminal = Some(term);
+                self.term_events = Some(rx);
+            }
+        }
+
+        if let Some(session) = self.session.as_ref() {
+            let pixel_width = (layout.cols * cell_w as usize).min(u16::MAX as usize) as u16;
+            let pixel_height = (layout.rows * cell_h as usize).min(u16::MAX as usize) as u16;
+            if let Err(err) = session.resize(
+                layout.cols as u16,
+                layout.rows as u16,
+                pixel_width,
+                pixel_height,
+            ) {
+                diag::warn(&format!("PTY resize 失败: {err:#}"));
+            }
+        }
+
+        self.dirty = true;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- 数据泵
+
+    /// 取走 PTY 输出并喂给 VT 状态机，然后处理终端事件。
+    fn pump_pty(&mut self) {
+        let chunks = match self.session.as_ref() {
+            Some(session) => session.drain(),
+            None => return,
+        };
+        if !chunks.is_empty() {
+            if let Some(term) = self.terminal.as_mut() {
+                for chunk in chunks {
+                    term.feed(&chunk);
+                }
+            }
+            self.dirty = true;
+        }
+
+        let mut events = Vec::new();
+        if let Some(rx) = self.term_events.as_ref() {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.handle_term_event(event);
+        }
+    }
+
+    fn handle_term_event(&mut self, event: Event) {
+        match event {
+            // 这条事件里装着 DSR 应答（`ESC[6n` → `ESC[行;列R`）。
+            // PowerShell 在 ConPTY 下会阻塞等它，丢掉就等于永久卡死。
+            Event::PtyWrite(text) => {
+                self.write_to_pty(text.as_bytes());
+            }
+            Event::Wakeup => {
+                self.dirty = true;
+            }
+            Event::Exit | Event::ChildExit(_) => {
+                diag::info("shell 已退出");
+                // SAFETY: 只投递线程消息。
+                unsafe { PostQuitMessage(0) };
+            }
+            // OSC 52 在 `security.osc52 = false` 时根本不会产生事件；
+            // 即使打开也只允许写入剪贴板（只读方向永久禁用）。
+            Event::ClipboardStore(_, _) => {
+                diag::info("忽略 OSC 52 剪贴板写入");
+            }
+            _ => {}
+        }
+    }
+
+    fn write_to_pty(&mut self, bytes: &[u8]) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if let Err(err) = session.write(bytes) {
+            diag::warn(&format!("写入 PTY 失败: {err:#}"));
+            return;
+        }
+        self.blink.reset(Instant::now());
+    }
+
+    // ---------------------------------------------------------------- 输入
+
+    fn handle_keydown(&mut self, vk: u32, mods: Modifiers) {
+        let Some(key) = map_vk(vk) else {
+            return;
+        };
+        // 普通字符键在没有 Ctrl/Alt 时留给 WM_CHAR——那里能拿到正确的
+        // Shift 状态与输入法组合结果。
+        if matches!(key, Key::Char(_)) && !mods.ctrl && !mods.alt {
+            return;
+        }
+        let mode = self
+            .terminal
+            .as_ref()
+            .map(|term| term.mode())
+            .unwrap_or_else(TermMode::empty);
+        if let Some(bytes) = input::encode(key, mods, mode) {
+            self.write_to_pty(&bytes);
+            // 同一个键会先来 WM_KEYDOWN 再来 WM_CHAR，这里打个标记避免发两遍。
+            self.suppress_next_char = true;
+        }
+    }
+
+    fn handle_char(&mut self, code: u32) {
+        if self.suppress_next_char {
+            self.suppress_next_char = false;
+            return;
+        }
+        let Some(ch) = char::from_u32(code) else {
+            return;
+        };
+        // 控制字符已经由 WM_KEYDOWN 处理过，丢掉以免重复。
+        if code < 0x20 || code == 0x7f {
+            return;
+        }
+        let mut buffer = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buffer).as_bytes().to_vec();
+        self.write_to_pty(&encoded);
+    }
+
+    // ---------------------------------------------------------------- 定时
+
+    fn tick(&mut self) {
+        self.pump_pty();
+
+        let now = Instant::now();
+        if self.blink.tick(now) {
+            self.dirty = true;
+        }
+
+        if self
+            .session
+            .as_mut()
+            .and_then(|session| session.try_exit_code())
+            .is_some()
+        {
+            diag::info("检测到子进程退出，关闭窗口");
+            // SAFETY: 只投递线程消息。
+            unsafe { PostQuitMessage(0) };
+            return;
+        }
+
+        if self.dirty && now.duration_since(self.last_render) >= RENDER_INTERVAL {
+            self.render();
+            self.last_render = now;
+            self.dirty = false;
+        }
+    }
+
+    fn render(&mut self) {
+        let (Some(painter), Some(surface), Some(term)) = (
+            self.painter.as_mut(),
+            self.surface.as_mut(),
+            self.terminal.as_ref(),
+        ) else {
+            return;
+        };
+        let (width, height) = self.surface_size;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            diag::warn("softbuffer buffer_mut 失败");
+            return;
+        };
+        {
+            let pixels: &mut [u32] = &mut buffer;
+            let mut frame = crate::render::Frame {
+                pixels,
+                width: width as usize,
+                height: height as usize,
+            };
+            painter.draw(
+                &mut frame,
+                &self.layout,
+                term,
+                self.blink.visible(),
+                self.focused,
+            );
+        }
+        if let Err(err) = buffer.present() {
+            diag::warn(&format!("softbuffer present 失败: {err}"));
+        }
+    }
+
+    // ---------------------------------------------------------------- 消息
+
     /// 消息分发。返回 `LRESULT`；未处理的消息由调用方转交默认过程。
     unsafe fn handle(
         &mut self,
@@ -110,11 +524,72 @@ impl App {
         _lparam: LPARAM,
     ) -> Option<LRESULT> {
         match msg {
+            WM_CREATE => {
+                if let Err(err) = self.initialize(hwnd) {
+                    diag::error(&format!("初始化失败: {err:#}"));
+                    self.show_terminal_error(&format!("初始化失败: {err}"));
+                }
+                Some(LRESULT(0))
+            }
             WM_PAINT => {
-                window::paint_solid(hwnd, self.background);
+                // SAFETY: 标准 BeginPaint/EndPaint 配对，用于验证无效区域。
+                unsafe {
+                    let mut ps = PAINTSTRUCT::default();
+                    let _ = BeginPaint(hwnd, &mut ps);
+                    let _ = EndPaint(hwnd, &ps);
+                }
+                self.dirty = true;
+                self.render();
+                self.last_render = Instant::now();
+                self.dirty = false;
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(window::ERASE_HANDLED),
+            WM_SIZE => {
+                if let Err(err) = self.apply_size(hwnd) {
+                    diag::warn(&format!("尺寸同步失败: {err:#}"));
+                }
+                Some(LRESULT(0))
+            }
+            WM_DPICHANGED => {
+                let new_dpi = (wparam.0 & 0xffff) as u32;
+                diag::info(&format!("DPI 变更为 {new_dpi}"));
+                if let Err(err) = self.reload_fonts(hwnd) {
+                    diag::warn(&format!("DPI 变更后重载字体失败: {err:#}"));
+                }
+                if let Err(err) = self.apply_size(hwnd) {
+                    diag::warn(&format!("DPI 变更后重排失败: {err:#}"));
+                }
+                Some(LRESULT(0))
+            }
+            WM_SETFOCUS => {
+                self.focused = true;
+                self.blink.set_enabled(true);
+                self.dirty = true;
+                Some(LRESULT(0))
+            }
+            WM_KILLFOCUS => {
+                self.focused = false;
+                self.blink.set_enabled(false);
+                self.dirty = true;
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let vk = wparam.0 as u32;
+                let mods = current_modifiers();
+                self.handle_keydown(vk, mods);
+                Some(LRESULT(0))
+            }
+            WM_CHAR => {
+                self.handle_char(wparam.0 as u32);
+                Some(LRESULT(0))
+            }
+            WM_TIMER => {
+                if wparam.0 == TIMER_TICK {
+                    self.tick();
+                }
+                Some(LRESULT(0))
+            }
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_ID_QUIT => {
@@ -139,6 +614,11 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_DESTROY => {
+                // SAFETY: hwnd 仍有效，注销本窗口的定时器。
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_TICK);
+                }
+                self.session = None;
                 // SAFETY: PostQuitMessage 只投递线程消息。
                 unsafe { PostQuitMessage(0) };
                 Some(LRESULT(0))
@@ -146,6 +626,52 @@ impl App {
             _ => None,
         }
     }
+}
+
+/// OSC 52 策略：默认关闭；打开也只允许写入剪贴板，读方向永久禁用。
+fn osc52_mode(config: &Config) -> Osc52 {
+    if config.security.osc52 {
+        Osc52::OnlyCopy
+    } else {
+        Osc52::Disabled
+    }
+}
+
+fn current_modifiers() -> Modifiers {
+    // SAFETY: GetKeyState 只读当前线程的键盘状态。
+    unsafe {
+        Modifiers {
+            shift: GetKeyState(VK_SHIFT.0 as i32) < 0,
+            ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
+            alt: GetKeyState(VK_MENU.0 as i32) < 0,
+        }
+    }
+}
+
+/// 虚拟键码 → 终端语义按键。返回 `None` 表示这个键不产生输入。
+fn map_vk(vk: u32) -> Option<Key> {
+    let key = match vk {
+        0x08 => Key::Backspace,
+        0x09 => Key::Tab,
+        0x0d => Key::Enter,
+        0x1b => Key::Escape,
+        0x20 => Key::Char(' '),
+        0x21 => Key::PageUp,
+        0x22 => Key::PageDown,
+        0x23 => Key::End,
+        0x24 => Key::Home,
+        0x25 => Key::Left,
+        0x26 => Key::Up,
+        0x27 => Key::Right,
+        0x28 => Key::Down,
+        0x2d => Key::Insert,
+        0x2e => Key::Delete,
+        0x30..=0x39 => Key::Char(char::from(b'0' + (vk - 0x30) as u8)),
+        0x41..=0x5a => Key::Char(char::from(b'a' + (vk - 0x41) as u8)),
+        0x70..=0x7b => Key::Function((vk - 0x6f) as u8),
+        _ => return None,
+    };
+    Some(key)
 }
 
 /// 窗口过程。任何 panic 都退化为默认处理，绝不跨 FFI 边界 unwind。
@@ -278,4 +804,54 @@ pub fn ex_style(hwnd: HWND) -> u32 {
 pub fn bound_user_data(hwnd: HWND) -> isize {
     // SAFETY: hwnd 有效。
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_letters_to_lowercase() {
+        assert_eq!(map_vk(0x41), Some(Key::Char('a')));
+        assert_eq!(map_vk(0x5a), Some(Key::Char('z')));
+    }
+
+    #[test]
+    fn maps_digits() {
+        assert_eq!(map_vk(0x30), Some(Key::Char('0')));
+        assert_eq!(map_vk(0x39), Some(Key::Char('9')));
+    }
+
+    #[test]
+    fn maps_function_keys() {
+        assert_eq!(map_vk(0x70), Some(Key::Function(1)));
+        assert_eq!(map_vk(0x7b), Some(Key::Function(12)));
+    }
+
+    #[test]
+    fn maps_navigation_keys() {
+        assert_eq!(map_vk(0x25), Some(Key::Left));
+        assert_eq!(map_vk(0x26), Some(Key::Up));
+        assert_eq!(map_vk(0x28), Some(Key::Down));
+        assert_eq!(map_vk(0x2e), Some(Key::Delete));
+    }
+
+    #[test]
+    fn ignores_unmapped_keys() {
+        assert_eq!(map_vk(0x10), None); // Shift
+        assert_eq!(map_vk(0x14), None); // CapsLock
+    }
+
+    #[test]
+    fn osc52_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(matches!(osc52_mode(&config), Osc52::Disabled));
+    }
+
+    #[test]
+    fn osc52_enabled_only_allows_copy() {
+        let mut config = Config::default();
+        config.security.osc52 = true;
+        assert!(matches!(osc52_mode(&config), Osc52::OnlyCopy));
+    }
 }

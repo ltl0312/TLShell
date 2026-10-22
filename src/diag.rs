@@ -16,6 +16,7 @@ const MAX_FILES: usize = 3;
 
 static SINK: Mutex<Option<File>> = Mutex::new(None);
 static VERBOSE: Mutex<bool> = Mutex::new(false);
+static DEBUG: Mutex<bool> = Mutex::new(false);
 
 /// 日志目录：`%LOCALAPPDATA%\TLShell\logs`。
 pub fn log_dir() -> Option<PathBuf> {
@@ -27,11 +28,14 @@ pub fn log_dir() -> Option<PathBuf> {
 
 /// 初始化日志。失败是静默降级：没有日志也要能跑。
 pub fn init() {
-    let verbose = std::env::var("TLSHELL_LOG")
-        .map(|v| v.eq_ignore_ascii_case("info") || v.eq_ignore_ascii_case("debug"))
-        .unwrap_or(false);
+    let raw = std::env::var("TLSHELL_LOG").unwrap_or_default();
+    let verbose = raw.eq_ignore_ascii_case("info") || raw.eq_ignore_ascii_case("debug");
+    let debug = raw.eq_ignore_ascii_case("debug");
     if let Ok(mut slot) = VERBOSE.lock() {
         *slot = verbose;
+    }
+    if let Ok(mut slot) = DEBUG.lock() {
+        *slot = debug;
     }
 
     let Some(dir) = log_dir() else { return };
@@ -104,6 +108,14 @@ pub fn error(message: &str) {
 
 pub fn warn(message: &str) {
     write_line("warn", &escape(message));
+}
+
+/// 调试级日志，只有 `TLSHELL_LOG=debug` 时才落盘。
+pub fn debug(message: &str) {
+    let enabled = DEBUG.lock().map(|v| *v).unwrap_or(false);
+    if enabled {
+        write_line("debug", &escape(message));
+    }
 }
 
 pub fn info(message: &str) {

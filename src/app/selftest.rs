@@ -81,7 +81,7 @@ pub fn run() -> Report {
         rect: dpi::Rect::new(40, 40, config.window.width, config.window.height),
     };
     let app: &'static mut crate::app::App =
-        Box::leak(Box::new(crate::app::App::new(config.clone())));
+        Box::leak(Box::new(crate::app::App::new_headless(config.clone())));
     let app_ptr: *mut std::ffi::c_void = (app as *mut crate::app::App).cast();
 
     let hwnd = match window::create(hinstance, &spec, app_ptr) {

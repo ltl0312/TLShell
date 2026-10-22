@@ -88,6 +88,18 @@ pub fn clamp_rect(rect: Rect, container: Rect, min_w: i32, min_h: i32) -> Rect {
     }
 }
 
+/// 窗口所在显示器的 DPI。`GetDpiForWindow` 在 Win10 1607+ 可用。
+pub fn window_dpi(hwnd: windows::Win32::Foundation::HWND) -> u32 {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    // SAFETY: 只读查询，hwnd 由调用方保证有效。
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi > 0 {
+        dpi
+    } else {
+        BASE_DPI
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
