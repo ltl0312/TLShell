@@ -168,3 +168,98 @@ arm `suppress_char_until`（50ms），紧随其后的 `WM_CHAR` 被丢弃。
 普通窗口永远在它上面。代价写在 README「已知限制 4」：最大化窗口会盖住它，需要
 `Ctrl+Alt+T` 或设置面板把这一项关掉。自检期间（`--probe-real`）临时不沉底，
 否则探针拿不到前台、合成事件会落到别人窗口上（本轮修的就是这个）。
+
+## 背景透明度与文字透明度分开（本轮）
+
+用户要求「字体的透明度和背景透明度分开，并且背景透明度下限设置为 0」。做法是把绘制面从
+`0x00RRGGBB` 改成**预乘 ARGB**，此后背景与文字各自带 alpha，互不影响：
+
+- `Painter::bg_alpha` 只作用于铺底（`Frame::clear_with`）与单元格底色；
+- `Painter::text_alpha` 只作用于字形覆盖度（`scale_coverage`）与下划线/删除线；
+- `config.window.opacity` 下限从 `0.10` 放开到 `0.00`，新增 `config.window.text_opacity`（下限 `0.10`）。
+
+### 像素级证据
+
+`scripts/verify-alpha-split.ps1` 生成两版配置（`opacity = 0.00`，`text_opacity` 分别 1.00 / 0.40），
+各落一帧（合成底色 `#1E1E2E`），再采样背景点与正文像素：
+
+| `text_opacity` | 背景取样 | 非背景像素 | 平均亮度 |
+|---|---|---|---|
+| 1.00 | (30,30,46) | 1677 | 152 |
+| 0.40 | (30,30,46) | 1662 | 82 |
+
+背景取样等于合成底色 `(30,30,46)`，说明**背景真的没画**（不是「画得很淡」）；
+正文平均亮度从 152 掉到 82，与 `35 + 0.40 × (152 − 35) = 81.8` 吻合，说明只有字变淡。
+这条脚本已接进 `run-all.ps1` 的 D 层（用例「背景/文字透明度互不影响」）。
+
+### 附带修掉的一个「点不动」
+
+分层窗口的命中测试按**像素 alpha** 做：alpha 为 0 的像素不接收鼠标，消息直接穿透到下面的
+窗口。背景透明度调到 0 之后，整块客户区变成「只有字形能点中」，点空白处等于点在后面的窗口上。
+修法：铺底 alpha 至少有 1/255（`MIN_PAINTED_ALPHA`，人眼不可见），客户区保持可点击。
+单测 `zero_background_alpha_still_keeps_the_surface_clickable` 锁这条不变量。
+
+## 搜狗输入法：组字期的拼音不该进 PTY
+
+用户反馈：微软拼音正常，搜狗拼音**组字期间终端就出现拼音字母**，回车选词后又上屏一遍。
+根因是判据选错了：`is_composing` 依赖 `ImmGetCompositionStringW(GCS_COMPSTR)`，而搜狗组字时
+这条不返回内容，于是 `is_composing` 恒为 false，字母被当成普通字符写进 PTY。
+
+现在的判据是**转换模式**而不是组字串：`ime::wants_native_input(hwnd)` 读
+`ImmGetConversionStatus`，只要处于中文/假名模式（`IME_CMODE_NATIVE | IME_CMODE_KATAKANA`）就
+不把字母写进 PTY，交给输入法自己在候选窗里处理；上屏结果仍走 `WM_IME_COMPOSITION`
+（`GCS_RESULTSTR`），与 `WM_IME_CHAR` 之间靠已有的 400 ms 去重挡重复。
+
+**诚实边界**：本机没有装搜狗输入法，自动化无法复现它的消息序列；这条修复的判据是
+Windows 官方转换模式语义（与输入法品牌无关），但「搜狗真机上确实只上屏一次」需要人工确认：
+
+1. `cargo build --release` → `target\release\tlshell.exe`；
+2. 切搜狗拼音，敲 `nihao` —— 终端里**不应**出现 `nihao`；
+3. 回车/空格选词 —— 终端里应恰好出现一次「你好」；
+4. 日志里若出现 `输入法上屏重复（同内容、另一条消息），已丢弃`，说明第二条消息被吞掉了。
+
+## 沉底到最底的可断言证据
+
+「沉底」以前只看 `SetWindowPos` 的返回值，它成功并不等于真的到了最底。新增
+`dock::windows_below(hwnd)`：沿 `GetWindow(GW_HWNDNEXT)` 数自己下面还剩几个窗口，并跳过
+`Progman` / `WorkerW` / `Shell_TrayWnd` 这类本来就在最底的壳窗口。启动日志因此变成：
+
+```
+[info] 启动沉底: ok=true 下方窗口=0
+```
+
+`run-all.ps1` C 层断言这行（用例「桌面层沉底到最底」）。点击时同样会重新沉底，日志
+`沉底: ok=true 下方窗口=N`（N 为点击瞬间的状态）——前台与键盘保持不变，只有叠放次序回最底。
+
+### 只数「下方窗口」不够：`HWND_BOTTOM` 会把窗口压到桌面下面
+
+`SetWindowPos(hwnd, HWND_BOTTOM)` 满足「下方窗口=0」，但它把窗口放到了
+`Progman`（桌面窗口）**之下**：`IsWindowVisible` 仍为 true、`windows_below` 仍是 0，
+而屏幕上什么都没有。这类「断言通过、用户看不到」的假证据比不做断言更坏。
+
+修法（`src/win/dock.rs::desktop_anchor`）：插入点改取「桌面窗口正上方的那个窗口」——
+`GetShellWindow()` 拿到 `Progman`，`GetWindow(Progman, GW_HWNDPREV)` 拿到它上面的一格，
+`SetWindowPos` 的语义是「排在这个窗口之后」，于是我们落在 `Progman` 之上、
+所有普通窗口之下：看得见，也不挡人。取不到桌面（非 explorer 外壳）时退回
+`HWND_BOTTOM`，并保留「不挡任何人」的语义。
+
+新增日志与断言：
+
+```
+[info] 启动沉底: ok=true 下方窗口=0 紧邻下方=Progman
+```
+
+- 用例「桌面层停在桌面上方」：`紧邻下方` 必须是 `Progman` 或 `WorkerW`。
+- 这两条合起来才是完整判据：**上面没人**（下方窗口=0）且 **下面就是桌面**
+  （紧邻下方=Progman/WorkerW），即「贴在桌面上、所有普通窗口之下」。
+
+## 设置面板的 9 行（含新增的两项透明度）
+
+`06-settings-panel-9rows.png` 由 `--open-settings --dump-frame` 落盘。面板行序：
+
+1. 背景不透明度（0.00–1.00，步长 0.02）
+2. 文字不透明度（0.10–1.00，步长 0.02）
+3. 字号 / 4. 行高 / 5. 内边距 / 6. 圆角
+7. 粘贴保护 / 8. OSC 52 写入剪贴板 / 9. 失焦沉到桌面层
+
+`↑↓` 选行、`←→` 调值、`Enter` 保存（`config::save_atomic`：`.toml.tmp` + `rename`）、`Esc` 取消。

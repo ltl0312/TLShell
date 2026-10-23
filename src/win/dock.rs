@@ -20,10 +20,10 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetWindowThreadProcessId,
-    IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
-    WindowFromPoint, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SW_SHOWNOACTIVATE,
+    GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetShellWindow, GetWindow,
+    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SwitchToThisWindow, WindowFromPoint, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_SHOWNOACTIVATE,
 };
 
 use crate::diag;
@@ -35,16 +35,92 @@ const RESTORE_COOLDOWN: Duration = Duration::from_secs(3);
 /// 一轮里最多找回几次；超过就只记日志、不再动手。
 const MAX_RESTORES: u32 = 3;
 
+/// 数一数自己下面还有几个窗口：真沉到底时是 0。
+///
+/// `GetWindow(GW_HWNDNEXT)` 走的是 z-order 链（取的是「下一个更下面」的窗口），
+/// 因此这条计数正好是「还有谁被我压在下面」。用来把「沉底」从一句日志变成
+/// 可断言的证据，而不是只看 `SetWindowPos` 的返回值。
+pub fn windows_below(hwnd: HWND) -> usize {
+    let mut count = 0usize;
+    let mut current = hwnd;
+    loop {
+        // SAFETY: GetWindow 只读 z-order 链，句柄来自调用方；计数有上限，
+        // 即使系统返回环状链也不会死循环。
+        let next = unsafe { GetWindow(current, GW_HWNDNEXT) };
+        match next {
+            Ok(window) if !window.0.is_null() => {
+                // 桌面与任务栏天然在 z-order 末尾，不算「被我们压住的窗口」，
+                // 否则沉底成功也永远数出 1～2 个，判据就废了。
+                if !is_desktop_class(window) {
+                    count += 1;
+                }
+                current = window;
+                if count >= 4096 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+/// 这个窗口是不是桌面/任务栏这类「本来就该在最底」的壳窗口。
+fn is_desktop_class(hwnd: HWND) -> bool {
+    let mut buffer = [0u16; 64];
+    // SAFETY: buffer 是栈上 64 个 u16，长度作为上限传入。
+    let written = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if written <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&buffer[..written as usize]);
+    matches!(
+        name.as_str(),
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Windows.UI.Core.CoreWindow"
+    )
+}
+
+/// 紧邻窗口下方的那个窗口的类名，用来证明「我确实贴在桌面上方」。
+///
+/// 沉底之后这里应当只剩桌面类窗口（`Progman` / `WorkerW`）；如果读出来是
+/// `Chrome_WidgetWin_1` 之类，说明我们其实还压在别人上面，或者被挤到了桌面下面。
+pub fn next_below_class(hwnd: HWND) -> String {
+    // SAFETY: 只读 z-order 链与类名，句柄来自调用方。
+    let next = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+    match next {
+        Ok(window) if !window.0.is_null() => {
+            let mut buffer = [0u16; 64];
+            // SAFETY: 栈上缓冲，长度作为上限传入。
+            let written = unsafe { GetClassNameW(window, &mut buffer) };
+            if written <= 0 {
+                "?".to_owned()
+            } else {
+                String::from_utf16_lossy(&buffer[..written as usize])
+            }
+        }
+        _ => "（无，窗口已在最底）".to_owned(),
+    }
+}
+
 /// 把窗口压到 z-order 最底部。
 ///
 /// 只改 z-order，不动位置、尺寸、激活状态与所有者关系。
 pub fn send_to_bottom(hwnd: HWND) -> bool {
-    // SAFETY: hwnd 由 CreateWindowExW 创建且在调用期间有效；
-    // 四个标志位都声明「不改动」对应属性，因此不会触发 WM_SIZE/WM_MOVE。
+    // 插入点不是 `HWND_BOTTOM`：那样会掉到 Progman（桌面）**下面**，窗口虽然
+    // 还在但被桌面整个盖住 —— `IsWindowVisible` 仍然为真，用户眼前却什么都没有。
+    // 正确的位置是「紧贴桌面上方」：`SetWindowPos` 的插入点是「排在我前面的窗口」，
+    // 所以取桌面窗口正上方的那个窗口作为锚点，我们就会落在锚点之下、桌面之上。
+    let insert_after = desktop_anchor().unwrap_or(HWND_BOTTOM);
+    // SAFETY: hwnd 由 CreateWindowExW 创建且在调用期间有效；插入点句柄只用于 z-order
+    // 定位，四个标志位都声明「不改动」对应属性，因此不会触发 WM_SIZE/WM_MOVE。
     let result = unsafe {
         SetWindowPos(
             hwnd,
-            Some(HWND_BOTTOM),
+            Some(insert_after),
             0,
             0,
             0,
@@ -57,6 +133,24 @@ pub fn send_to_bottom(hwnd: HWND) -> bool {
         return false;
     }
     true
+}
+
+/// 「紧贴桌面上方」的插入点：桌面窗口在 z-order 里的前一个窗口。
+///
+/// 找不到桌面（非 explorer 外壳、会话锁屏等）时返回 `None`，调用方退回
+/// `HWND_BOTTOM` —— 那时至少还满足「不挡任何人」。
+fn desktop_anchor() -> Option<HWND> {
+    // SAFETY: GetShellWindow 只是查询外壳窗口句柄，不改变任何状态。
+    let shell = unsafe { GetShellWindow() };
+    if shell.0.is_null() {
+        return None;
+    }
+    // SAFETY: 同上，取 z-order 前驱；返回空句柄表示桌面已在最上层。
+    let above = unsafe { GetWindow(shell, GW_HWNDPREV) };
+    match above {
+        Ok(window) if !window.0.is_null() && window != shell => Some(window),
+        _ => None,
+    }
 }
 
 /// 三种焦点相关事实的快照，用于「点击后到底有没有拿到键盘」的现场取证。

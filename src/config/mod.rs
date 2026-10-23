@@ -151,8 +151,12 @@ width = {width}
 height = {height}
 x = {x}
 y = {y}
-# 0.10 到 1.00。低于 0.70 时正文对比度可能不足。
+# 背景透明度，0.00 到 1.00。0 表示背景完全不可见，只剩文字。
+# 低于 0.70 时正文对比度可能不足（只告警，不阻止）。
 opacity = {opacity}
+# 文字透明度，0.10 到 1.00。与背景透明度互不影响：
+# 背景调到 0 也能保持文字清晰，把字调淡也不会让背景变透。
+text_opacity = {text_opacity}
 padding = {padding}
 border_radius = {border_radius}
 # 失焦后沉到所有窗口之下（桌面层模式）。默认 false：普通 z-order，点得到也打得进。
@@ -193,6 +197,7 @@ paste_guard = {paste_guard}
         x = defaults.window.x,
         y = defaults.window.y,
         opacity = defaults.window.opacity,
+        text_opacity = defaults.window.text_opacity,
         padding = defaults.window.padding,
         border_radius = defaults.window.border_radius,
         sink_when_unfocused = defaults.window.sink_when_unfocused,
@@ -217,7 +222,11 @@ paste_guard = {paste_guard}
 /// 透明度低于该值时正文对比度会掉到不可读区间，仅告警不拒绝。
 pub const OPACITY_WARN_BELOW: f64 = 0.70;
 /// 透明度硬下界。计划书 §9 M4-② 要求 0.5 仍能明显变透，因此下界不能抬到 0.75。
-pub const OPACITY_MIN: f64 = 0.10;
+/// 背景透明度的下限：0 表示「背景完全不可见」。
+pub const OPACITY_MIN: f64 = 0.00;
+
+/// 文字透明度的下限：再低就看不见字了。
+pub const TEXT_OPACITY_MIN: f64 = 0.10;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -254,7 +263,10 @@ pub struct WindowConfig {
     pub height: i32,
     pub x: i32,
     pub y: i32,
+    /// 背景透明度（0 = 背景全透明，只剩文字与装饰）。
     pub opacity: f64,
+    /// 文字透明度，只乘在字形覆盖度上。
+    pub text_opacity: f64,
     pub padding: i32,
     pub border_radius: i32,
     /// 失焦时把窗口沉到最底层（"桌面层"模式）。
@@ -273,6 +285,7 @@ impl Default for WindowConfig {
             x: 40,
             y: 40,
             opacity: 0.88,
+            text_opacity: 1.0,
             padding: 10,
             border_radius: 8,
             sink_when_unfocused: true,
@@ -376,6 +389,10 @@ impl Config {
             self.window.opacity = WindowConfig::default().opacity;
         }
         self.window.opacity = self.window.opacity.clamp(OPACITY_MIN, 1.0);
+        if !self.window.text_opacity.is_finite() {
+            self.window.text_opacity = WindowConfig::default().text_opacity;
+        }
+        self.window.text_opacity = self.window.text_opacity.clamp(TEXT_OPACITY_MIN, 1.0);
 
         // 圆角不能超过短边的一半，否则自绘时弧线会自交。
         let max_radius = self.window.width.min(self.window.height) / 2;

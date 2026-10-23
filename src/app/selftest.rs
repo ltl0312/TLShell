@@ -121,7 +121,12 @@ pub fn run() -> Report {
                 for pixel in pixels.iter_mut() {
                     *pixel = 0x00FF_FFFF;
                 }
-                surface::apply_round_mask(pixels, 4, 4, 0.0, config.window.opacity);
+                // 先把缓冲写成「背景 alpha + 白色」，再确认掩膜不改 alpha。
+                let alpha = (config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+                for pixel in pixels.iter_mut() {
+                    *pixel = (alpha << 24) | (alpha << 16) | (alpha << 8) | alpha;
+                }
+                surface::apply_round_mask(pixels, 4, 4, 0.0);
             }
             let pixels = dib.pixels_mut();
             let expected = (config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;

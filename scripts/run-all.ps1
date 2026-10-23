@@ -41,6 +41,8 @@ Set-Location $root
 
 $exe = Join-Path $root 'target\debug\tlshell.exe'
 $logPath = Join-Path $env:LOCALAPPDATA 'TLShell\logs\tlshell.log'
+# 日志路径在启动时算一次；子脚本会把 LOCALAPPDATA 指到沙箱，漏还原就再也读不到新行。
+$originalLocalData = $env:LOCALAPPDATA
 $evidenceDir = Join-Path $root 'docs\aegis\evidence\test\M6'
 New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
 
@@ -169,6 +171,35 @@ raise = "Ctrl+Alt+F11"
     return @{ Path = $path; Opacity = $opacity; Padding = $padding; Radius = $radius }
 }
 
+# 真实输入探针用一份固定、合理的几何：轮次配置的 padding/radius 会随轮次放大到
+# 荒唐值，网格小到点哪都落在格线外，那不是被测代码的问题。
+function New-ProbeConfig {
+    $dir = Join-Path $env:TEMP 'aegis-probe'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $path = Join-Path $dir 'config.toml'
+    $body = @'
+[window]
+width = 900
+height = 420
+x = 40
+y = 40
+opacity = 0.88
+text_opacity = 1.00
+padding = 10
+border_radius = 8
+sink_when_unfocused = false
+[font]
+size = 14
+line_height = 1.25
+[keys]
+quit = "Ctrl+Alt+F9"
+hide = "Ctrl+Alt+F10"
+raise = "Ctrl+Alt+F11"
+'@
+    Set-Content -Path $path -Value $body -Encoding utf8
+    return [pscustomobject]@{ Path = $path }
+}
+
 function Invoke-LayerA {
     if ($SkipBuild) {
         Add-Result A 'cargo fmt --check' SKIP '按 -SkipBuild 跳过'
@@ -186,7 +217,8 @@ function Invoke-LayerA {
         Add-Result A 'cargo fmt --check' FAIL $detail
     }
 
-    $clippy = Invoke-Capture 'cargo' @('clippy', '--all-targets', '--offline', '--', '-D', 'warnings')
+    # 编译时间随改动量波动，30 秒会误报超时
+    $clippy = Invoke-Capture 'cargo' @('clippy', '--all-targets', '--offline', '--', '-D', 'warnings') -TimeoutSeconds 420
     if ($clippy.Code -eq 0) {
         Add-Result A 'cargo clippy -D warnings' PASS '无告警'
     }
@@ -197,7 +229,17 @@ function Invoke-LayerA {
         Add-Result A 'cargo clippy -D warnings' FAIL '存在告警'
     }
 
-    $test = Invoke-Capture 'cargo' @('test', '--offline')
+    # cargo test 只更新测试二进制，C 层跑的 target\debug\tlshell.exe 还是旧的
+    $build = Invoke-Capture 'cargo' @('build', '--offline') -TimeoutSeconds 420
+    if ($build.Code -eq 0) {
+        Add-Result A 'cargo build' PASS 'debug 可执行文件已重建'
+    }
+    else {
+        $detail = (($build.Text -split "`n") | Select-Object -Last 6) -join ' | '
+        Add-Result A 'cargo build' FAIL $detail
+    }
+
+    $test = Invoke-Capture 'cargo' @('test', '--offline') -TimeoutSeconds 420
     if ($test.Code -eq 0 -and $test.Text -match 'test result: ok\. (\d+) passed') {
         $count = $Matches[1]
         Add-Result A 'cargo test' PASS "$count passed"
@@ -211,6 +253,8 @@ function Invoke-LayerA {
 # ---------------------------------------------------------------- B 层
 
 function Invoke-LayerB {
+    # 残留实例会占住 Ctrl+Alt+Q/H/T，selftest 的 hotkey_register 会因此 FAIL。
+    Stop-AllInstances
     if (-not (Test-Path $exe)) {
         Add-Result B 'selftest' BLOCKED '找不到 tlshell.exe（先跑 A 层编译）'
         return
@@ -363,7 +407,17 @@ function Invoke-LayerC {
             Add-Result C '圆角内不透明' $(if ($edge[0] -lt 200) { 'PASS' } else { 'FAIL' }) "top_edge=R$($edge[0]) G$($edge[1]) B$($edge[2])"
         }
 
-        # 单实例：第二个进程必须立刻退出。
+        # 交互类用例要活着的窗口：诊断进程落盘后自行退出，另起常驻实例。
+        if (-not $proc.HasExited) {
+            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+            [void]$proc.WaitForExit(3000)
+        }
+        $offsetUi = Get-LogLength
+        $proc = Start-Process -FilePath $exe -ArgumentList '--config', $script:roundConfig.Path -PassThru
+        $uiStarted = Wait-ForLogLine -Offset $offsetUi -Pattern '启动完成' -TimeoutSeconds 20
+        Add-Result C '常驻实例启动' $(if ($uiStarted) { 'PASS' } else { 'FAIL' }) '启动完成'
+
+        # 单实例：第二个进程必须唤醒已有实例后立刻退出。
         $second = Invoke-Capture $exe @()
         Add-Result C '单实例判重' $(if ($second.Code -eq 0) { 'PASS' } else { 'FAIL' }) "第二个实例 exit=$($second.Code)"
 
@@ -437,6 +491,26 @@ function Invoke-LayerD {
 
     # 壁纸两端：白底与黑底各落一帧，正文对比度都必须 ≥ 4.5:1。
     # 没有录屏工具链也能验：落盘的是推给 UpdateLayeredWindow 的同一份像素，
+    # 透明度拆分：背景 alpha=0 时背景必须完全不画，文字透明度独立生效。
+    Stop-AllInstances
+    $alpha = & (Join-Path $PSScriptRoot 'verify-alpha-split.ps1') 2>&1
+    $alphaFailed = @($alpha | Where-Object { $_ -match '^\[FAIL\]' }).Count
+    $alphaPassed = @($alpha | Where-Object { $_ -match '^\[PASS\]' }).Count
+    $alphaDetail = @($alpha | Where-Object { $_ -match 'FAIL' }) -join ' | '
+    Add-Result D '背景/文字透明度互不影响' $(if ($alphaFailed -eq 0 -and $alphaPassed -ge 3) { 'PASS' } else { 'FAIL' }) "通过 $alphaPassed 项，失败 $alphaFailed 项 $alphaDetail"
+
+    # 标签栏：`+` / `×` / 「清屏」三个热区必须真的命中，关到空要自动补一个可用 shell。
+    Stop-AllInstances
+    $tabs = & (Join-Path $PSScriptRoot 'verify-tabs.ps1') 2>&1
+    $tabsFailed = @($tabs | Where-Object { $_ -match '^\[FAIL\]' }).Count
+    $tabsPassed = @($tabs | Where-Object { $_ -match '^\[PASS\]' }).Count
+    $tabsDetail = @($tabs | Where-Object { $_ -match 'FAIL' }) -join ' | '
+    Add-Result D '标签栏按钮可点' $(if ($tabsFailed -eq 0 -and $tabsPassed -ge 6) { 'PASS' } else { 'FAIL' }) "通过 $tabsPassed 项，失败 $tabsFailed 项 $tabsDetail"
+
+    # 自启动开关：注册表能读写并读回。
+    $autoStatus = Invoke-Capture $exe @('--autostart', 'status')
+    Add-Result D '自启动状态可读' $(if ($autoStatus.Code -eq 0 -and $autoStatus.Text -match '随 Windows 启动') { 'PASS' } else { 'FAIL' }) "exit=$($autoStatus.Code) out=$($autoStatus.Text.Trim())"
+
     # 换合成底色就等于换壁纸。
     $wall = & (Join-Path $PSScriptRoot 'verify-wallpaper.ps1') 2>&1
     $ratios = @()
@@ -464,11 +538,15 @@ function Invoke-LayerD {
     try {
         New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
         Set-Content -Path $cfgPath -Value 'this is not toml [[[' -Encoding utf8
+        # 判据是「真的启动起来了」而不是「进程还活着」：--dump-frame 属于诊断模式，
+        # 落盘后 0.6 秒自己退出；单实例锁也会让第二个进程唤醒别人后立刻退出。
+        Stop-AllInstances
+        $env:LOCALAPPDATA = $originalLocalData
         $offset = Get-LogLength
-        $proc = Start-Process -FilePath $exe -ArgumentList '--dump-frame', (Join-Path $env:TEMP 'aegis-badcfg.bmp') -PassThru -Environment @{ TLSHELL_NO_MODAL = '1' }
-        Start-Sleep -Seconds 4
-        $alive = -not $proc.HasExited
-        Add-Result D '坏配置仍能启动' $(if ($alive) { 'PASS' } else { 'FAIL' }) "alive=$alive"
+        $proc = Start-Process -FilePath $exe -PassThru -Environment @{ TLSHELL_NO_MODAL = '1'; TLSHELL_LOG = 'info' }
+        $started = Wait-ForLogLine -Offset $offset -Pattern '启动完成' -TimeoutSeconds 15
+        $tail = ((Get-LogTail $offset) -split "`n" | Select-Object -Last 4) -join ' / '
+        Add-Result D '坏配置仍能启动' $(if ($started) { 'PASS' } else { 'FAIL' }) "started=$([bool]$started) 末尾日志：$tail"
         if (-not $proc.HasExited) { $proc | Stop-Process -Force -ErrorAction SilentlyContinue }
     }
     finally {
@@ -533,11 +611,22 @@ function Invoke-LayerE {
     Stop-AllInstances
     $offset = Get-LogLength
     $env:TLSHELL_LOG = 'debug'
-    $proc = Start-Process -FilePath $exe -ArgumentList '--config', $script:roundConfig.Path, '--probe-real' -PassThru
+    # 探针要点的次数、拖选的像素都依赖合理几何；轮次配置的 padding/radius 会随轮次
+    # 放大到荒唐值（padding=186/radius=184），点哪都「落在网格外」。
+    $probeConfig = New-ProbeConfig
+    $proc = Start-Process -FilePath $exe -ArgumentList '--config', $probeConfig.Path, '--probe-real' -PassThru
     try {
         $log = Wait-ForLogLine -Offset $offset -Pattern '真实输入结算' -TimeoutSeconds 25
         if (-not $log) {
-            Add-Result E '真实输入链路' FAIL '25 秒内没有结算日志'
+            # 置顶全屏窗口占着桌面时，探针按设计拿不到前台、一个事件都不发。
+            # 那不是被测代码的缺陷，但也不能静默记 PASS —— 落 SKIP 并写明原因。
+            $slice = Get-LogTail $offset
+            if ($slice -match '真实探针中止：(.+)') {
+                Add-Result E '真实输入链路' SKIP "探针在拿到前台之前中止：$($Matches[1])"
+            }
+            else {
+                Add-Result E '真实输入链路' FAIL "25 秒内没有结算日志（日志 $($slice.Length) 字符）"
+            }
             return
         }
         $checks = [ordered]@{
@@ -580,10 +669,17 @@ for ($round = 1; $round -le $Rounds; $round++) {
     $script:layerFailures = @{ A = 0; B = 0; C = 0; D = 0; E = 0 }
 
     $script:roundConfig = New-RoundConfig -Round $round
+    # 每层开始前复位日志目录：子脚本会把 LOCALAPPDATA 指到沙箱。
+    # APPDATA 保持本轮沙箱（New-RoundConfig 已设），否则 state.json 跨轮污染几何。
+    $env:LOCALAPPDATA = $originalLocalData
     Invoke-LayerA
+    $env:LOCALAPPDATA = $originalLocalData
     Invoke-LayerB
+    $env:LOCALAPPDATA = $originalLocalData
     Invoke-LayerC
+    $env:LOCALAPPDATA = $originalLocalData
     Invoke-LayerD
+    $env:LOCALAPPDATA = $originalLocalData
     if ($RealInput) { Invoke-LayerE }
 
     $reportPath = Join-Path $evidenceDir ("round-{0}.md" -f $round)

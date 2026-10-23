@@ -139,6 +139,30 @@ impl Default for Theme {
 }
 
 /// 线性插值，`t` 是 0..=255 的覆盖度。
+/// 把「直通色」按覆盖度合成到「预乘 ARGB」像素上。
+///
+/// 和 [`blend`] 的区别是这里处理的是**像素**而不是颜色：目标像素的 A 通道
+/// 参与运算，源像素按覆盖度先预乘再叠加。文字画在透明背景上时，
+/// `dst` 的 alpha 是 0，合成结果的 alpha 就等于覆盖度——文字自己不会变透明。
+pub fn over(dst: u32, src: u32, coverage: u8) -> u32 {
+    if coverage == 0 {
+        return dst;
+    }
+    let sa = u32::from(coverage);
+    if sa == 255 {
+        return 0xFF00_0000 | (src & 0x00FF_FFFF);
+    }
+    let inv = 255 - sa;
+    let dst_a = (dst >> 24) & 0xFF;
+    let out_a = sa + (dst_a * inv) / 255;
+    let mix = |shift: u32| -> u32 {
+        let d = (dst >> shift) & 0xFF;
+        let s = (src >> shift) & 0xFF;
+        (s * sa + d * inv) / 255
+    };
+    (out_a << 24) | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
 pub fn blend(dst: u32, src: u32, coverage: u8) -> u32 {
     if coverage == 0 {
         return dst;

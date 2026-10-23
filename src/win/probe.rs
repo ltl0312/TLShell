@@ -170,6 +170,22 @@ pub struct RealGuard {
     cursor: (i32, i32),
 }
 
+/// 客户区中心点上的窗口是不是自己。
+///
+/// 前台锁在无人值守环境里经常连「附加输入队列」一起拒（实测别的程序正抢前台时
+/// 就是这样），但**真实输入本来就不需要先有前台**：窗口已经在最上层、光标点落在
+/// 自己身上时，注入的点击自然会落到自己身上，并由这次点击取得前台。
+/// 因此把「本窗口覆盖着那个点」当作可以注入的充分条件，比「必须先有前台」更贴近事实。
+fn window_covers(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+    let Some(center) = center_of(hwnd) else {
+        return false;
+    };
+    // SAFETY: 只读查询指定屏幕坐标上的窗口。
+    let hit = unsafe { WindowFromPoint(center) };
+    hit == hwnd
+}
+
 fn foreground_is(hwnd: HWND) -> bool {
     // SAFETY: 只读查询，无副作用。
     unsafe { GetForegroundWindow() == hwnd }
@@ -186,9 +202,17 @@ fn ensure_foreground(hwnd: HWND, phase: Phase) -> bool {
     if foreground_is(hwnd) {
         return true;
     }
-    let ok = force_foreground(hwnd) && foreground_is(hwnd);
-    note(phase, &format!("前台被抢走，重新取回={ok}"));
-    ok
+    let ok = force_foreground(hwnd);
+    let ready = foreground_is(hwnd) || window_covers(hwnd);
+    note(
+        phase,
+        &format!(
+            "前台被抢走，重新取回={ok} 前台={} 命中自己={}",
+            foreground_is(hwnd),
+            window_covers(hwnd)
+        ),
+    );
+    ready
 }
 
 /// 自检专用：用一次「附加输入队列」把前台强行拿过来，随即分离。
@@ -229,8 +253,12 @@ fn force_foreground(hwnd: HWND) -> bool {
     let other = unsafe { GetWindowThreadProcessId(target, None) };
     // SAFETY: GetCurrentThreadId 无参数、无副作用。
     let mine = unsafe { GetCurrentThreadId() };
-    if other == 0 || other == mine {
+    if other == 0 {
         return false;
+    }
+    if other == mine {
+        // 前台已经在自己的输入队列里：不需要（也不该）附加，直接取焦点即可。
+        return crate::win::dock::take_keyboard_focus(hwnd).keyboard_ready();
     }
     // SAFETY: 附加的是本线程到前台线程的输入队列，成对分离。
     let attached = unsafe { AttachThreadInput(mine, other, true) }.as_bool();
@@ -246,7 +274,17 @@ fn force_foreground(hwnd: HWND) -> bool {
             let _ = AttachThreadInput(mine, other, false);
         }
     }
-    crate::win::dock::raise_and_focus(hwnd).keyboard_ready()
+    let mut report = crate::win::dock::raise_and_focus(hwnd);
+    // 前台锁偶尔连附加线程的请求一起拒（实测有别的程序正抢前台）。
+    // 再试两轮，别因为一次失败就把整条真实输入链路判死。
+    for _ in 0..2 {
+        if report.keyboard_ready() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        report = crate::win::dock::raise_and_focus(hwnd);
+    }
+    report.keyboard_ready()
 }
 
 pub fn begin_real(hwnd: HWND) -> Option<RealGuard> {
@@ -291,6 +329,15 @@ pub fn begin_real(hwnd: HWND) -> Option<RealGuard> {
         // 只在本探针里做，用完立刻分离；产品路径从不使用 AttachThreadInput
         // （它会把本进程的键盘状态与被附加进程绑在一起）。
         ok = force_foreground(hwnd) && foreground_is(hwnd);
+    }
+    if !ok && window_covers(hwnd) {
+        // 前台锁连附加线程一起拒时，只要点击点确实落在自己窗口上就仍然安全：
+        // 注入的点击会落到自己身上，并由这次点击本身把前台拿过来。
+        ok = true;
+        note(
+            Phase::RealRaise,
+            "前台没拿到，但窗口覆盖点击点：按「命中自己」继续",
+        );
     }
     note(
         Phase::RealRaise,

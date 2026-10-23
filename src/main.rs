@@ -42,9 +42,43 @@ struct Options {
     dump_frame: Option<std::path::PathBuf>,
     /// 落盘时的合成底色（`RRGGBB`）。白底是最差条件，黑底是另一种极端。
     dump_bg: Option<u32>,
+    /// 启动即打开设置面板：给视觉取证拍面板截图用，正常运行不会带。
+    open_settings: bool,
+    /// UI 自动化测试模式：跳单实例锁、强制不沉底、不自动退出。
+    /// 只给 `scripts/verify-*.ps1` 用；正常启动不会带这个参数。
+    ui_test: bool,
+    /// --autostart on|off|status：读写 HKCU\...\Run，不启动界面。
+    autostart: Option<String>,
+}
+
+/// 用法说明。`--help` 走 stdout、退出码 0：它不是错误，不该弹模态框。
+fn usage() -> &'static str {
+    "用法: TLShell.exe [选项]
+
+  （无参数）                启动终端
+  --config <PATH>           使用指定配置文件（保存也写回这份）
+  --reset-position          忘掉记住的位置，回到配置里的坐标
+  --quit                    让已有实例退出
+  --restart-unelevated      以管理员运行时，经 explorer 降权重启
+  --autostart on|off|status 读写 HKCU 的 Run 项（随 Windows 启动）
+  --open-settings           启动即展开设置面板
+  --selftest [--report PATH] 无界面自检（可写 JSON 报告）
+  --probe-input             合成消息自检：点击/拖选/ASCII/CJK/emoji
+  --probe-real              真实 SendInput 自检（结束归还前台）
+  --dump-frame <PATH>       首帧落盘为 24 位 BMP
+  --dump-bg <RRGGBB>        落盘时的合成底色（默认白）
+  --ui-test                 验收脚本用：跳单实例锁、不沉底、不自动退出
+  --help, -h                打印这份说明"
 }
 
 fn main() -> ExitCode {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(err) => return fail(&format!("参数错误: {err:#}")),
@@ -54,14 +88,28 @@ fn main() -> ExitCode {
 
     // 环境前置校验（安全评审 F-03 / F-05）：配置目录与用户目录拿不到时显式失败。
     // 从前会退化到「当前目录」，那会让程序在被启动的任意目录里写配置和状态文件。
-    if !options.selftest && !options.quit && !options.restart_unelevated {
+    if !options.selftest
+        && !options.quit
+        && !options.restart_unelevated
+        && options.autostart.is_none()
+    {
         if let Err(err) = preflight_environment() {
             return fail(&format!("运行环境不可用: {err:#}"));
         }
     }
 
     // 单实例锁必须活到进程结束，所以绑在 main 里而不是 run_normal 里。
-    let _instance = if options.selftest || options.quit || options.restart_unelevated {
+    // 自检类运行（`--selftest` / `--probe-*` / `--dump-frame`）是独立的一次性诊断，
+    // 不参与单实例互斥：否则用户开着终端时，验证跑不起来，只能拿到「已有实例」。
+    let diagnostic_only = options.selftest
+        || options.quit
+        || options.restart_unelevated
+        || options.autostart.is_some()
+        || options.probe_input
+        || options.probe_real
+        || options.dump_frame.is_some()
+        || options.ui_test;
+    let _instance = if diagnostic_only {
         None
     } else {
         match win::single::ensure_single() {
@@ -69,7 +117,7 @@ fn main() -> ExitCode {
             Err(err) => return fail(&format!("单实例检测失败: {err:#}")),
         }
     };
-    if _instance.is_none() && !options.selftest && !options.quit && !options.restart_unelevated {
+    if _instance.is_none() && !diagnostic_only {
         // 已有实例在跑：唤醒它之后安静退出，不算错误。
         return ExitCode::SUCCESS;
     }
@@ -78,6 +126,16 @@ fn main() -> ExitCode {
         run_selftest(&options)
     } else if options.restart_unelevated {
         run_restart_unelevated()
+    } else if let Some(action) = options.autostart.as_deref() {
+        // 命令行式用法不弹模态框：无人值守调用会挂死在 MessageBox 上。
+        match run_autostart(action) {
+            Ok(code) => return ExitCode::from(code),
+            Err(err) => {
+                diag::error(&format!("--autostart 失败: {err:#}"));
+                eprintln!("--autostart 失败: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else if options.quit {
         run_quit_request()
     } else {
@@ -127,6 +185,30 @@ fn show_fatal(message: &str) {
     }
 }
 
+/// `--autostart on|off|status`：只改用户级注册表项，不启动界面。
+///
+/// 用「读回来」判定成败：`reg.exe` 的退出码在值已存在时可能仍是 0，
+/// 而用户真正在意的是「下次开机窗口还在不在」。
+fn run_autostart(action: &str) -> Result<u8> {
+    match action {
+        "on" => {
+            let exe = std::env::current_exe().context("取不到当前可执行文件路径")?;
+            if !win::autostart::enable(&exe) {
+                anyhow::bail!("写入 {} 失败", win::autostart::RUN_KEY);
+            }
+        }
+        "off" => {
+            if !win::autostart::disable() {
+                anyhow::bail!("删除 {} 的值失败", win::autostart::RUN_KEY);
+            }
+        }
+        "status" => {}
+        other => anyhow::bail!("--autostart 只接受 on|off|status，收到 {other}"),
+    }
+    println!("{}", win::autostart::describe());
+    Ok(0)
+}
+
 fn run_normal(options: &Options) -> Result<u8> {
     let loaded = load_config(options);
     for warning in &loaded.warnings {
@@ -138,15 +220,17 @@ fn run_normal(options: &Options) -> Result<u8> {
     let config = loaded.config;
 
     let rect = resolve_rect(&config, options.reset_position);
-    let code = app::run(
+    let code = app::run(app::RunOptions {
         config,
-        Some(rect),
-        options.probe_input,
-        options.probe_real,
-        options.dump_frame.clone(),
-        options.dump_bg,
-        options.config_path.clone(),
-    )?;
+        rect: Some(rect),
+        input_probe: options.probe_input,
+        real_probe: options.probe_real,
+        dump_frame: options.dump_frame.clone(),
+        dump_bg: options.dump_bg,
+        config_path: options.config_path.clone(),
+        open_settings: options.open_settings,
+        ui_test: options.ui_test,
+    })?;
     Ok(code.clamp(0, 255) as u8)
 }
 
@@ -253,6 +337,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
             "--selftest" => options.selftest = true,
             "--probe-input" => options.probe_input = true,
             "--probe-real" => options.probe_real = true,
+            "--open-settings" => options.open_settings = true,
+            "--ui-test" => options.ui_test = true,
             "--dump-frame" => {
                 index += 1;
                 let value = pending
@@ -271,6 +357,14 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
                     crate::win::window::parse_rgb(&value)
                         .with_context(|| format!("--dump-bg 不是 RRGGBB：{value}"))?,
                 );
+            }
+            "--autostart" => {
+                index += 1;
+                let value = pending
+                    .get(index)
+                    .cloned()
+                    .context("--autostart 需要 on|off|status")?;
+                options.autostart = Some(value);
             }
             "--quit" => options.quit = true,
             "--restart-unelevated" => options.restart_unelevated = true,
@@ -291,11 +385,10 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Options> {
                     .context("--config 需要一个路径参数")?;
                 options.config_path = Some(PathBuf::from(value));
             }
+            // `main` 在解析之前就拦下 `--help`，这里只防御直接调用 parse_args 的场合。
             "--help" | "-h" => {
                 pending.clear();
-                return Err(anyhow::anyhow!(
-                    "用法: TLShell.exe [--config <PATH>] [--quit] [--probe-input] [--selftest [--report <PATH>]]"
-                ));
+                return Ok(options);
             }
             other => {
                 return Err(anyhow::anyhow!("未知参数 `{other}`"));

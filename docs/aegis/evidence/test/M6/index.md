@@ -12,13 +12,14 @@ pwsh -NoProfile -File .\scripts\run-all.ps1 -Rounds 6
 
 | 层 | 内容 | 项数 |
 |---|---|---|
-| A 静态门禁 | `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` | 3 |
+| A 静态门禁 | `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo build`、`cargo test` | 4 |
 | B 无界面自检 | `--selftest --report`，逐项断言 `ok`（12 项，含 IME 结果串空值），并断言退出码 | 2 |
-| C 真机功能探针 | `--probe-input --dump-frame`：日志链路 14 项 + 落盘像素 5 项 + 单实例 1 项 + 设置面板 4 项 + 唤起热键 1 项 | 25 |
-| D 行为负例 | `--quit` 真退出、`--restart-unelevated` 非提权退 0、未知参数拒绝、坏配置仍启动、缺 `USERPROFILE` 拒绝启动、白/黑壁纸对比度 | 6 |
-| E 真实输入（可选，`-RealInput`） | `--probe-real`：真实点击命中自己、拿到焦点、拖选出选区、按键写进 PTY、**敲出整词 `ipconfig`**、归还前台 | 6 |
+| C 真机功能探针 | `--probe-input --dump-frame`：日志链路 13 项 + 落盘像素 5 项 + 常驻实例 1 项 + 单实例 1 项 + 设置面板 4 项 + 唤起热键 1 项 | 25 |
+| D 行为负例 | `--quit` 无实例退 0 / 真的退出实例、背景与文字透明度互不影响（3 项子判定）、标签栏按钮可点（6 项子判定）、自启动状态可读、白/黑壁纸对比度、`--restart-unelevated` 非提权退 0、未知参数拒绝、坏配置仍启动、缺 `USERPROFILE` 拒绝启动 | 10 |
+| E 真实输入（可选，`-RealInput`） | `--probe-real`：真实点击命中自己、拿到焦点、拖选出选区、按键写进 PTY、**敲出整词 `ipconfig`**、输入法上屏去重、归还前台 | 7 |
 
-合计 **43 项/轮**（含 E 层时）。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
+合计 **48 项/轮**（含 E 层时）。`cargo build` 是必须的一步：`cargo test` 只更新测试二进制，
+C 层跑的 `target\debug\tlshell.exe` 还是旧的，旧 exe 会让新断言恒不匹配，看起来像产品缺陷。C 层只往自己的窗口 `PostMessage`（不碰 `SendInput`/`mouse_event`），
 E 层（`-RealInput`）用真实 `SendInput`，每个发送函数发送前都确认前台仍是自己；
 结束时把前台还给原窗口，因此可以在用户正常工作时不打断地跑。
 
@@ -26,12 +27,12 @@ E 层（`-RealInput`）用真实 `SendInput`，每个发送函数发送前都确
 
 | 轮次 | 参数组合（`opacity` / `padding` / `radius` / `font`） | 结论 | 报告 |
 |---|---|---|---|
-| 1 | 0.82 / 8 / 6 / 13 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
-| 2 | 0.84 / 10 / 8 / 14 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
-| 3 | 0.86 / 12 / 10 / 15 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
-| 4 | 0.88 / 14 / 12 / 16 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
-| 5 | 0.90 / 16 / 14 / 17 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
-| 6 | 0.92 / 18 / 16 / 18 | PASS 43 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
+| 1 | 0.82 / 8 / 6 / 13 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-1.md](round-1.md) |
+| 2 | 0.84 / 10 / 8 / 14 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-2.md](round-2.md) |
+| 3 | 0.86 / 12 / 10 / 15 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-3.md](round-3.md) |
+| 4 | 0.88 / 14 / 12 / 16 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-4.md](round-4.md) |
+| 5 | 0.90 / 16 / 14 / 17 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-5.md](round-5.md) |
+| 6 | 0.92 / 18 / 16 / 18 | PASS 48 / FAIL 0 / BLOCKED 0 | [round-6.md](round-6.md) |
 
 每轮用 `%TEMP%\aegis-round-N\config.toml` 换一组参数，所以六轮不只是「同一套用例跑六次」：
 它同时验证参数变化（透明度、内边距、圆角、字号）不会破坏任何链路。
@@ -40,7 +41,7 @@ E 层（`-RealInput`）用真实 `SendInput`，每个发送函数发送前都确
 窗口尺寸并顶掉 `config` 的 `width/height`，不隔离的话 C 层像素判据会读到上一轮的几何
 （本轮就踩到 `1024x730`）。
 
-`cargo test` 167 passed，clippy 零告警，fmt 干净。
+`cargo test` 177 passed，clippy 零告警，fmt 干净，release 构建通过。
 
 ## 关键断言（不是「跑完没报错」）
 
@@ -57,13 +58,30 @@ E 层（`-RealInput`）用真实 `SendInput`，每个发送函数发送前都确
 - **自检不抢用户**：`前台已还给 <hwnd>（True）`，或明确记录「没有可归还的前台」。
 - **键盘字符真的对**：真实按键敲 `ipconfig`，八个字节必须按顺序是
   `105,112,99,111,110,102,105,103`。这条是「扫描码被当成 UTF-16 码元」缺陷的端到端回归。
+- **桌面层停在桌面上方**：`启动沉底: ok=true 下方窗口=0 紧邻下方=Progman|WorkerW`。
+- **背景与文字透明度是两个独立量**：`opacity=0.00` 时背景像素必须等于合成底色（背景真的没画），
+  而正文亮度随 `text_opacity` 线性变化（1.0 → 平均 157，0.4 → 78，比值 0.398 对期望 0.400）。
+  这条同时钉住一个真实缺陷：分层窗口按像素 alpha 做命中测试，全透明会把整块区域变成点不中，
+  所以底色被钳到 1/255 而不是 0（`MIN_PAINTED_ALPHA`）。
+- **标签栏热区**：`点击标签栏 @(107,15) 栏高=30 单元格=11: New` → `新建标签: shell 2`；
+  `Close(1)` → `关闭标签: shell 2`；关到空会立刻补一个带会话的 `shell 1`。
+- **设置写入磁盘**：`F2` → 两次 `→` → `Enter` → `opacity` 从 0.82 变 0.86（按当轮值算，不写死）。
+  只断言「下方窗口=0」不够 —— 用 `HWND_BOTTOM` 时窗口会掉到 `Progman` **下面**，
+  依然 `IsWindowVisible`、依然算「沉底成功」，但用户屏幕上什么也看不到。
+  紧邻下方的类名才是「贴在桌面上、所有普通窗口之下」的可断言证据。
 
 ## 诚实范围
 
 - 六轮是同一套用例、六种参数组合；它不是六份不同的用例集。
+- **每轮 43 项**（A 层 4、B 层 2、C 层 28、D 层 8、E 层 8；E 层不可用时计 SKIP 而不是静默跳过）。
 - **真实鼠标点击的路由**由 E 层（`-RealInput`）验证：真实 `SendInput` 走完整链路 ——
   `抬到最前 → 命中自己 → 真实点击 → 键盘就绪 → 拖选扩展 → 写入 PTY`。
   常规回归不跑它（会动真实鼠标键盘），只在需要时手动执行。
+- **E 层在「有置顶全屏窗口」的会话里记 SKIP**：探针 `begin_real` 确认拿不到前台时
+  按设计一个事件都不发，并写明原因（`真实探针中止：前台没拿到`）。这时报告里是
+  `SKIP=1` 而不是 `PASS`，避免把「没跑」显示成「跑过且通过」。
+- **A 层多了 `cargo build`**：`cargo test` 只更新测试二进制，不重建
+  `target\debug\tlshell.exe`；旧 exe 让 C 层新断言恒不匹配，曾伪装成产品缺陷。
 - **提权重启的提权分支**、**IME 真机上屏**、**中间灰壁纸**、**录屏类动态过渡**未验证，
   逐条列在 [M7 证据](../vis/M7/index.md#未验证项不掩饰)。
 

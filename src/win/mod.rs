@@ -1,5 +1,6 @@
 //! Win32 窗口层。
 
+pub mod autostart;
 pub mod clipboard;
 pub mod dock;
 pub mod dpi;

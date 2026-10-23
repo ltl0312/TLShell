@@ -104,7 +104,25 @@ impl Settings {
     pub fn from_config(config: &Config) -> Self {
         Self {
             items: vec![
-                Item::slider("不透明度", config.window.opacity, 0.10, 1.00, 0.02, 2, ""),
+                // 背景透明度下限是 0：调到 0 就是「只有文字贴在壁纸上」。
+                Item::slider(
+                    "背景不透明度",
+                    config.window.opacity,
+                    0.00,
+                    1.00,
+                    0.02,
+                    2,
+                    "",
+                ),
+                Item::slider(
+                    "文字不透明度",
+                    config.window.text_opacity,
+                    0.10,
+                    1.00,
+                    0.02,
+                    2,
+                    "",
+                ),
                 Item::slider("字号", config.font.size, 6.0, 72.0, 1.0, 0, "px"),
                 Item::slider("行高", config.font.line_height, 0.8, 3.0, 0.05, 2, "x"),
                 Item::slider(
@@ -128,6 +146,9 @@ impl Settings {
                 Item::switch("粘贴保护", config.security.paste_guard),
                 Item::switch("OSC 52 写入剪贴板", config.security.osc52),
                 Item::switch("失焦沉到桌面层", config.window.sink_when_unfocused),
+                // 这一项不写进 config.toml：它是注册表里的状态，打开面板时现读，
+                // 保存时按当前值去登记/取消，避免「配置文件说开、注册表里没有」。
+                Item::switch("随 Windows 启动", crate::win::autostart::is_enabled()),
             ],
             selected: 0,
             dirty: false,
@@ -175,27 +196,41 @@ impl Settings {
             config.window.opacity = value;
         }
         if let Some(value) = get(1) {
-            config.font.size = value;
+            config.window.text_opacity = value;
         }
         if let Some(value) = get(2) {
-            config.font.line_height = value;
+            config.font.size = value;
         }
         if let Some(value) = get(3) {
-            config.window.padding = value.round() as i32;
+            config.font.line_height = value;
         }
         if let Some(value) = get(4) {
-            config.window.border_radius = value.round() as i32;
+            config.window.padding = value.round() as i32;
         }
         if let Some(value) = get(5) {
-            config.security.paste_guard = value > 0.5;
+            config.window.border_radius = value.round() as i32;
         }
         if let Some(value) = get(6) {
-            config.security.osc52 = value > 0.5;
+            config.security.paste_guard = value > 0.5;
         }
         if let Some(value) = get(7) {
+            config.security.osc52 = value > 0.5;
+        }
+        if let Some(value) = get(8) {
             config.window.sink_when_unfocused = value > 0.5;
         }
         config.sanitize();
+    }
+
+    /// 最后一项（随 Windows 启动）当前是开还是关。
+    ///
+    /// 单独开一个访问器，是为了让保存路径显式处理它——它不是配置字段，
+    /// 而是注册表状态，写错了用户下次开机就看不到窗口。
+    pub fn autostart_requested(&self) -> Option<bool> {
+        self.items
+            .last()
+            .filter(|item| item.toggle)
+            .map(|item| item.value > 0.5)
     }
 
     /// 绘制用的行文本：(标签, 值)。
@@ -219,10 +254,12 @@ mod tests {
         config.security.paste_guard = false;
         let settings = Settings::from_config(&config);
         assert!((settings.items[0].value - 0.66).abs() < 1e-9);
-        assert_eq!(settings.items[1].value, 18.0);
-        assert_eq!(settings.items[5].value, 0.0);
-        // 7 个可调项 + 沉底开关 = 8 行。
-        assert_eq!(settings.rows().len(), 8);
+        // 背景与文字透明度是两个独立滑块（用户要求分开）。
+        assert_eq!(settings.items[1].value, 1.0);
+        assert_eq!(settings.items[2].value, 18.0);
+        assert_eq!(settings.items[6].value, 0.0);
+        // 8 个可调项 + 沉底开关 + 自启动开关 = 10 行。
+        assert_eq!(settings.rows().len(), 10);
     }
 
     #[test]
@@ -267,14 +304,14 @@ mod tests {
     fn toggle_flips_and_round_trips_into_config() {
         let mut config = Config::default();
         let mut settings = Settings::from_config(&config);
-        settings.selected = 5;
+        settings.selected = 6;
         // 默认粘贴保护是开的，翻一次变成「关」。
         assert!(settings.adjust(true));
-        assert_eq!(settings.items[5].value_text(), "关");
+        assert_eq!(settings.items[6].value_text(), "关");
         settings.apply(&mut config);
         assert!(!config.security.paste_guard);
 
-        settings.selected = 6;
+        settings.selected = 7;
         assert!(settings.adjust(true));
         settings.apply(&mut config);
         assert!(config.security.osc52);

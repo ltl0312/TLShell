@@ -62,6 +62,9 @@ pub fn remember(hwnd: isize) {
         crate::diag::warn("hwnd 文件不可写：配置目录不可定位");
         return;
     };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Err(err) = std::fs::write(&path, format!("{hwnd}")) {
         crate::diag::warn(&format!("写入 hwnd 文件失败: {err}"));
     }

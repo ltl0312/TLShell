@@ -1,4 +1,4 @@
-# 第 4 轮全量测试（2026-10-22 22:21:17 +08:00）
+# 第 4 轮全量测试（2026-10-23 20:50:21 +08:00）
 
 本轮参数：opacity=0.88 padding=14 radius=12
 
@@ -8,7 +8,8 @@
 |---|---|---|---|
 | A | cargo fmt --check | PASS | 格式一致 |
 | A | cargo clippy -D warnings | PASS | 无告警 |
-| A | cargo test | PASS | 167 passed |
+| A | cargo build | PASS | debug 可执行文件已重建 |
+| A | cargo test | PASS | 177 passed |
 | B | selftest 全部通过 | PASS | 12 项 |
 | B | selftest 退出码 | PASS | exit=0 |
 | C | 窗口创建为顶层 | PASS | window hwnd=0x |
@@ -29,7 +30,8 @@
 | C | BMP 尺寸 | PASS | 900x420 |
 | C | 通道序 R/B 未颠倒 | PASS | bg=R57 G57 B71，期望 57/57/71（opacity=0.88） |
 | C | 圆角外透明(V-19) | PASS | corner=R255 G255 B255 |
-| C | 圆角内不透明 | PASS | top_edge=R57 G57 B71 |
+| C | 圆角内不透明 | PASS | top_edge=R108 G111 B129 |
+| C | 常驻实例启动 | PASS | 启动完成 |
 | C | 单实例判重 | PASS | 第二个实例 exit=0 |
 | C | 设置面板打开 | PASS | F2 |
 | C | 设置写入落盘 | PASS | Enter |
@@ -37,10 +39,13 @@
 | C | 唤起热键生效 | PASS | Ctrl+Alt+T |
 | D | --quit 无实例退 0 | PASS | exit=0 |
 | D | --quit 真的退出实例 | PASS | aliveBefore=True closed=True |
-| D | 白/黑壁纸对比度 ≥ 4.5:1 | PASS | 测得 8.23/9.09，最差 8.23 |
+| D | 背景/文字透明度互不影响 | PASS | 通过 3 项，失败 0 项  |
+| D | 标签栏按钮可点 | PASS | 通过 6 项，失败 0 项  |
+| D | 自启动状态可读 | PASS | exit=0 out=随 Windows 启动: 已开启（"D:\Code\Rust\TLShell\target\debug\tlshell.exe"） |
+| D | 白/黑壁纸对比度 ≥ 4.5:1 | PASS | 测得 8.15/11.88，最差 8.15 |
 | D | 降权重启在非提权下退 0 | PASS | exit=0 |
 | D | 未知参数被拒绝 | PASS | exit=1 |
-| D | 坏配置仍能启动 | PASS | alive=True |
+| D | 坏配置仍能启动 | PASS | started=True 末尾日志：[info] 启动完成: rect=900x420@(40,40); client=900x420; dpi=130 / [info] 命中自检: (490, 250) -> 其他窗口:Chrome_RenderWidgetHostHWND pid=35172 句柄=0x60dc2 可见=true 沉底=true / [info] ConPTY 切到 Win32 输入模式（?9001h）；本终端继续发送 VT 序列 /  |
 | D | 缺 USERPROFILE 拒绝启动 | PASS | exited=True exit=1 |
 | E | 真实点击命中自己 | PASS | 真实点击@.*moved=true down=true up=true |
 | E | 真实点击拿到焦点 | PASS | (点击取焦点: foreground=true\|抬到最前 foreground=true) |
@@ -50,6 +55,6 @@
 | E | 输入法上屏去重 | PASS | IME 去重自检: 第一次写入=[1-9]\d* 字节 第二次写入=0 字节 去重=true |
 | E | 前台已归还 | PASS | 前台已还给\|没有可归还的前台 |
 
-汇总：PASS=43
+汇总：PASS=48
 
 C 层只向自己的窗口 `PostMessage`，不注入系统级输入；自检结束把前台还给原窗口。

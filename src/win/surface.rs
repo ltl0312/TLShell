@@ -112,13 +112,15 @@ impl Surface {
         unsafe { std::slice::from_raw_parts_mut(self.bits, self.width * self.height) }
     }
 
-    /// 把当前像素推给分层窗口：圆角按 `radius` 抗锯齿，整体再乘 `opacity`。
-    pub fn present(&mut self, hwnd: HWND, radius: f32, opacity: f64) -> Result<()> {
+    /// 把当前像素推给分层窗口：圆角按 `radius` 抗锯齿。
+    ///
+    /// 透明度不再在这里折——每个像素自带 alpha（背景透明度与文字透明度已经
+    /// 在绘制阶段分开算好），这里只把圆角覆盖度乘上去。
+    pub fn present(&mut self, hwnd: HWND, radius: f32) -> Result<()> {
         let (width, height) = (self.width, self.height);
-        let alpha = opacity.clamp(0.0, 1.0);
         {
             let pixels = self.pixels_mut();
-            apply_round_mask(pixels, width, height, radius, alpha);
+            apply_round_mask(pixels, width, height, radius);
         }
 
         let mut rect = Default::default();
@@ -171,14 +173,8 @@ impl Drop for Surface {
 ///
 /// `UpdateLayeredWindow` 要的是**预乘** BGRA：`AC_SRC_ALPHA` 下每个通道
 /// 都必须先乘 alpha，否则半透明区域会发白发灰（V-02 文字稀释就是这么来的）。
-pub fn apply_round_mask(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
-    radius: f32,
-    opacity: f64,
-) {
-    let opacity = opacity.clamp(0.0, 1.0);
+/// 按圆角覆盖度削减像素的 alpha（预乘缓冲，颜色通道同比缩放）。
+pub fn apply_round_mask(pixels: &mut [u32], width: usize, height: usize, radius: f32) {
     for y in 0..height {
         for x in 0..width {
             let index = y * width + x;
@@ -186,19 +182,30 @@ pub fn apply_round_mask(
                 continue;
             };
             let coverage = round_rect_coverage(x, y, width, height, radius);
-            let alpha = (f64::from(coverage) * opacity * 255.0)
-                .round()
-                .clamp(0.0, 255.0) as u32;
-            let color = *slot & 0x00FF_FFFF;
+            if coverage >= 1.0 {
+                continue;
+            }
+            if coverage <= 0.0 {
+                *slot = 0;
+                continue;
+            }
+            let pixel = *slot;
+            let alpha = (pixel >> 24) & 0xFF;
             if alpha == 0 {
                 *slot = 0;
                 continue;
             }
+            let scaled = (alpha as f32 * coverage).round().clamp(0.0, 255.0) as u32;
+            if scaled == 0 {
+                *slot = 0;
+                continue;
+            }
+            let ratio = scaled as f32 / alpha as f32;
             let scale = |shift: u32| -> u32 {
-                let channel = (color >> shift) & 0xFF;
-                (channel * alpha + 127) / 255
+                let channel = (pixel >> shift) & 0xFF;
+                (channel as f32 * ratio).round().clamp(0.0, 255.0) as u32
             };
-            *slot = (alpha << 24) | (scale(16) << 16) | (scale(8) << 8) | scale(0);
+            *slot = (scaled << 24) | (scale(16) << 16) | (scale(8) << 8) | scale(0);
         }
     }
 }
@@ -301,17 +308,22 @@ mod tests {
     }
 
     #[test]
-    fn mask_premultiplies_and_folds_opacity() {
-        let mut pixels = vec![0x00FF_FFFFu32; 4];
-        apply_round_mask(&mut pixels, 2, 2, 0.0, 0.5);
-        // alpha = round(0.5 * 255) = 128；白色预乘后三通道都等于 128。
-        assert_eq!(pixels[0], (128 << 24) | (128 << 16) | (128 << 8) | 128);
+    fn mask_scales_alpha_only_at_rounded_corners() {
+        // 8×8 圆角半径 2：角 (0,0) 完全在圆外，(4,4) 在内部。
+        let mut pixels = vec![0xFFFF_FFFF_u32; 64];
+        apply_round_mask(&mut pixels, 8, 8, 2.0);
+        // 角落格子是部分覆盖：alpha 被显著削减，但不是 0（那就是硬边了）。
+        let corner = (pixels[0] >> 24) & 0xFF;
+        assert!(corner < 128, "角上的 alpha={corner} 没被削减");
+        assert_eq!(pixels[4 * 8 + 4], 0xFFFF_FFFF, "内部像素不该被掩膜改动");
     }
 
     #[test]
-    fn fully_transparent_pixels_become_zero() {
-        let mut pixels = vec![0x00FF_FFFF_u32; 4];
-        apply_round_mask(&mut pixels, 2, 2, 0.0, 0.0);
-        assert!(pixels.iter().all(|pixel| *pixel == 0));
+    fn mask_never_increases_alpha() {
+        let mut pixels = vec![0x80FF_FFFF_u32; 64];
+        apply_round_mask(&mut pixels, 8, 8, 2.0);
+        for pixel in pixels {
+            assert!((pixel >> 24) & 0xFF <= 0x80, "掩膜只能削减 alpha");
+        }
     }
 }

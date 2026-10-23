@@ -32,16 +32,20 @@ cargo build --release
 ## 运行
 
 ```powershell
-.	lshell.exe                          # 启动
-.	lshell.exe --quit                   # 让已有实例退出（真的退出，不是空操作）
-.	lshell.exe --restart-unelevated     # 以管理员运行时，经 explorer 降权重启
-.	lshell.exe --reset-position         # 忘掉记住的位置，回到默认 40,40
-.	lshell.exe --config PATH            # 用指定配置文件（保存也写回这份）
-.	lshell.exe --selftest --report PATH # 无界面自检，写 JSON 报告
-.	lshell.exe --probe-input            # 合成消息自检：点击/拖选/ASCII/CJK/emoji
-.	lshell.exe --probe-real             # 真实 SendInput 自检（短暂抬到最前，结束归还前台）
-.	lshell.exe --dump-frame PATH        # 首帧落盘为 BMP，用于像素级验收
-.	lshell.exe --dump-bg RRGGBB         # 落盘时的合成底色（默认白，用于模拟浅色壁纸）
+.\tlshell.exe                          # 启动
+.\tlshell.exe --quit                   # 让已有实例退出（真的退出，不是空操作）
+.\tlshell.exe --restart-unelevated     # 以管理员运行时，经 explorer 降权重启
+.\tlshell.exe --reset-position         # 忘掉记住的位置，回到默认 40,40
+.\tlshell.exe --config PATH            # 用指定配置文件（保存也写回这份）
+.\tlshell.exe --selftest --report PATH # 无界面自检，写 JSON 报告
+.\tlshell.exe --probe-input            # 合成消息自检：点击/拖选/ASCII/CJK/emoji
+.\tlshell.exe --probe-real             # 真实 SendInput 自检（短暂抬到最前，结束归还前台）
+.\tlshell.exe --dump-frame PATH        # 首帧落盘为 BMP，用于像素级验收
+.\tlshell.exe --dump-bg RRGGBB         # 落盘时的合成底色（默认白，用于模拟浅色壁纸）
+.\tlshell.exe --open-settings          # 启动即展开设置面板（配合 --dump-frame 拍面板）
+.\tlshell.exe --autostart on|off|status # 读写 HKCU 的 Run 项（任务管理器启动页可见）
+.\tlshell.exe --ui-test                # 验收脚本用：跳单实例锁、不沉底、不自动退出
+.	lshell.exe --help                   # 打印全部选项（stdout、退出码 0，不弹窗）
 ```
 
 `--probe-input` / `--dump-frame` 只向自己的窗口 `PostMessage`，不注入系统级输入。
@@ -57,16 +61,40 @@ cargo build --release
 | 滚轮 | 回看历史 3 行/格；打字自动回到底部 |
 | 拖选 | 选中文本，`Ctrl+C` 复制（无选区时 `Ctrl+C` 仍是中断） |
 | `Ctrl+V` | 粘贴。剥离 C0/C1 控制字符；含多行时底部提示条要求 3 秒内再按一次确认；终端支持时用 bracketed paste 包裹 |
+| 顶部标签栏 | 一条导航栏：点标签切换、点 `×` 关掉、点 `+` 新建、点「清屏」清空当前标签的回滚 |
+| `Ctrl+T` / `Ctrl+W` | 新建 / 关闭当前标签（关掉最后一个会自动补一个新的） |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | 循环切换标签 |
+| `Ctrl+L` | 清屏：向当前标签发 `ESC[3J ESC[2J ESC[H`，回滚一起清掉 |
 | `F2` 或 `Ctrl+,` | 打开设置面板（↑↓ 选择、←→ 调整、`Enter` 保存、`Esc` 取消） |
 | `Ctrl+Alt+T` | 把窗口唤到前台并取键盘焦点（沉底模式下用它叫回来） |
 | `Ctrl+Alt+Q` | 退出 |
 | `Ctrl+Alt+H` | 隐藏 |
 
 底部提示条（一行，3 秒后消失，启动告警留 30 秒）用于：粘贴确认、剪贴板失败、
-热键注册失败、以管理员权限运行。
+热键注册失败、以管理员权限运行、设置保存结果。
+
+每个标签是一个独立的 shell 进程（`Session` 各自持有 Job Object），关标签即杀子进程；
+关闭动作把会话回收丢到后台线程，不在 UI 线程 `join` 读线程——那个 `join` 没有超时，
+卡住就是整个窗口冻结（点 `×` 之后点哪里都没反应）。
 
 **提权态有常驻标记**：进程以管理员权限运行时，边框内侧会一直有一圈两像素的黄色警示线
 （不随提示条消失）。无边框窗口没有标题栏可以提示完整性级别，只靠 30 秒提示条不够。
+
+## 配置
+
+`%APPDATA%\TLShell\config.toml`（`--config` 可另指定，且保存也写回该文件）。
+改完由文件监视热重载；`security.*` 与窗口尺寸之外的字段即时生效。
+
+```toml
+[window]
+opacity = 0.88          # 背景透明度，0.00–1.00（0 = 背景完全不画）
+text_opacity = 1.00     # 文字透明度，0.10–1.00（只影响字形，不影响背景）
+padding = 10            # 内边距（逻辑像素），同时是拖动区
+border_radius = 8
+sink_when_unfocused = true  # 失焦沉到桌面层；false = 普通窗口行为
+```
+
+`F2` 或 `Ctrl+,` 打开设置面板可以直接改前几项，`Enter` 保存（原子写：`.toml.tmp` + `rename`）。
 
 ## 已知限制
 
@@ -74,15 +102,21 @@ cargo build --release
 
 1. **Win+D 后焦点丢失**：需要点击终端才能继续输入。系统行为，无法绕过（Rainmeter 的输入框同样如此）。
 2. **点击终端会激活它**：这是能打字的必要条件。TLShell 不加 `WS_EX_NOACTIVATE`。
-3. **只有整窗 alpha，没有模糊**：无边框分层窗口在 `UpdateLayeredWindow` 下不享受 DWM 的
-   亚克力/Mica 背景特效。整窗 alpha 是「文字和背景一起变透」，`opacity` 调到 `0.70` 以下
-   正文对比度会跌破 4.5:1（`OPACITY_WARN_BELOW` 会在启动时告警，但不阻止）。
-   要做「背景透、文字不透」需要把文字层单独合成，属于另一条渲染路线。
+3. **没有模糊，只有 alpha**：无边框分层窗口在 `UpdateLayeredWindow` 下不享受 DWM 的
+   亚克力/Mica 背景特效。背景与文字的透明度是**两个独立的量**：
+   `window.opacity`（背景，下限 `0.00`）与 `window.text_opacity`（文字，下限 `0.10`），
+   设置面板前两行即可调。
+   `text_opacity` 低于 `0.70` 时正文对比度会跌破 4.5:1（启动时告警，不阻止）。
+   背景透明度设成 `0.00` 时背景完全不绘制，只剩文字与装饰；但铺底仍保留 `1/255` 的 alpha，
+   因为分层窗口按像素 alpha 做命中测试，alpha `0` 的像素会把鼠标让给下面的窗口。
 4. **默认沉在桌面层**：窗口是**顶层窗口**（`parent = NULL`）。Win32 键盘焦点属于线程
    输入队列，`SetFocus` 只能设给同队列的窗口；把窗口 `SetParent` 到 `WorkerW` 会变成 explorer
    队列的子窗口，键盘**永远到不了**它 —— 所以「挂进桌面」这条路已经删除。
-   `window.sink_when_unfocused` 默认 `true`：失焦后沉到 `HWND_BOTTOM`，像壁纸一样待在桌面层，
-   任何普通窗口都在它上面。代价是最大化的窗口会盖住它，要用 `Ctrl+Alt+T` 叫回来。
+   `window.sink_when_unfocused` 默认 `true`：失焦后沉到**紧贴桌面的那一格**
+   （`GetShellWindow()` 的 `Progman` 之上、所有普通窗口之下），像桌面小部件一样待在
+   壁纸上，任何普通窗口都在它上面。沉底不是 `HWND_BOTTOM` —— 那样会掉到桌面**下面**，
+   窗口还在、屏幕上却什么都没有（`IsWindowVisible` 依然为真，是最容易骗过测试的一种「成功」）。
+   代价是最大化的窗口会盖住它，要用 `Ctrl+Alt+T` 叫回来。
    想要「点得到、打得进」的普通终端行为，把这一项改成 `false`（设置面板最后一项，改完立即生效）。
    启动时会先 `HWND_TOPMOST` 抬到最前并取焦点 —— 后台进程抢前台会被 Windows 的前台锁
    拒绝（实测 `focus_set=true` 而 `foreground=false`），这时保持 topmost 让窗口看得见、
@@ -96,7 +130,9 @@ cargo build --release
 10. **桌面图标会画在它上面**：图标层由 explorer 绘制，位置固定在最上层。
 11. **不支持拖放文件**：不注册 `WS_EX_ACCEPTFILES`，也不处理 `WM_DROPFILES`。
 12. **输入法只做定位与上屏**：`WM_IME_STARTCOMPOSITION` 时把候选窗口挪到光标位置；
-    组字期间（`ImmGetCompositionStringW(GCS_COMPSTR)` 非空）键盘完全交给输入法，终端不自己翻译；
+    组字期间键盘完全交给输入法，终端不自己翻译；判据是**转换模式**
+    （`ImmGetConversionStatus` 的 `IME_CMODE_NATIVE/KATAKANA`）而不是 `GCS_COMPSTR`——
+    搜狗等输入法组字时后者为空，用它判会把拼音字母写进终端；
     上屏结果只写一次 —— 微软拼音会同时发 `WM_IME_COMPOSITION`(`GCS_RESULTSTR`) 与
     `WM_IME_CHAR`，两条内容相同、先后不保证，因此按「内容 + 来源 + 400ms 窗口」去重
     （命中时日志里有一行 `输入法上屏重复…已丢弃`，warn 级，默认可见）。
@@ -123,7 +159,8 @@ cargo build --release
 ## 测试
 
 ```powershell
-pwsh -NoProfile -File .\scriptsun-all.ps1 -Rounds 6   # 四层 36 项/轮
+pwsh -NoProfile -File .\scripts
+un-all.ps1 -Rounds 6   # 四层 36 项/轮
 pwsh -NoProfile -File .\scripts\gate.ps1              # 提交门禁（含 cargo deny）
 ```
 
@@ -134,7 +171,8 @@ pwsh -NoProfile -File .\scripts\gate.ps1              # 提交门禁（含 cargo
 另有一层**默认关闭**的真实输入层（会移动光标、点击自己的窗口、临时抢前台）：
 
 ```powershell
-pwsh -NoProfile -File .\scriptsun-all.ps1 -Rounds 1 -SkipBuild -RealInput   # 加 5 项，共 38 项
+pwsh -NoProfile -File .\scripts
+un-all.ps1 -Rounds 1 -SkipBuild -RealInput   # 加 5 项，共 38 项
 ```
 
 它用真实 `SendInput` 走完整链路（点击 → 取焦点 → 拖选 → 按键 → 写 PTY → 归还前台），

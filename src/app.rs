@@ -125,6 +125,28 @@ const CORNER_BAND: i32 = 16;
 const MIN_WIDTH: i32 = 480;
 const MIN_HEIGHT: i32 = 240;
 
+/// 一个终端标签：自己的网格、事件通道与 PTY 会话。
+///
+/// 输出通道按会话隔离（`Session::drain` 只取自己那条队列），所以切标签既不用给
+/// 输出打标记，也不可能串台——这是「多终端可以叠放」能廉价做对的原因。
+struct Tab {
+    title: String,
+    terminal: Option<Terminal>,
+    events: Option<Receiver<Event>>,
+    session: Option<Session>,
+}
+
+impl Tab {
+    fn new(title: &str) -> Self {
+        Self {
+            title: title.to_owned(),
+            terminal: None,
+            events: None,
+            session: None,
+        }
+    }
+}
+
 pub struct App {
     hwnd: HWND,
     config: Config,
@@ -136,9 +158,10 @@ pub struct App {
 
     /// 自检路径不启动 shell、不建渲染面。
     headless: bool,
-    terminal: Option<Terminal>,
-    term_events: Option<Receiver<Event>>,
-    session: Option<Session>,
+    /// 打开的终端标签；至少一个。每个标签自带网格、事件通道与 PTY 会话。
+    tabs: Vec<Tab>,
+    /// 当前显示的标签下标（永远落在 `0..tabs.len()`）。
+    active_tab: usize,
     painter: Option<Painter>,
     surface: Option<LayeredSurface>,
     surface_size: (u32, u32),
@@ -204,6 +227,10 @@ pub struct App {
     dump_due: Option<Instant>,
     /// 自检期间写进 PTY 的字节数。
     probe_writes: usize,
+    /// 自检收尾后的退出时刻（诊断进程不常驻）。
+    quit_due: Option<Instant>,
+    /// `--open-settings`：启动即展开设置面板（视觉取证用）。
+    open_panel_at_startup: bool,
 }
 
 /// 真机输入自检的状态机。
@@ -250,9 +277,8 @@ impl App {
             hide_hotkey: None,
             startup_warnings: Vec::new(),
             headless,
-            terminal: None,
-            term_events: None,
-            session: None,
+            tabs: vec![Tab::new("shell 1")],
+            active_tab: 0,
             painter: None,
             surface: None,
             surface_size: (0, 0),
@@ -288,10 +314,146 @@ impl App {
             dump_bg: 0x00FF_FFFF,
             dump_due: None,
             probe_writes: 0,
+            quit_due: None,
+            open_panel_at_startup: false,
         };
         // 光标闪烁同样只在真正有焦点时开（B7 的另一半）。
         app.blink.set_enabled(false);
         app
+    }
+
+    // ------------------------------------------------------------ 标签
+
+    /// 当前标签下标，永远落在范围内。
+    ///
+    /// `tabs` 不为空时 `active_tab` 才可信；用 `min` 做一次兜底，避免关标签之后
+    /// 有一个瞬间下标越界就 panic（用户点得比程序快）。
+    fn active_index(&self) -> usize {
+        self.active_tab.min(self.tabs.len().saturating_sub(1))
+    }
+
+    fn tab_terminal(&self) -> Option<&Terminal> {
+        self.tabs.get(self.active_index())?.terminal.as_ref()
+    }
+
+    fn tab_terminal_mut(&mut self) -> Option<&mut Terminal> {
+        let index = self.active_index();
+        self.tabs.get_mut(index)?.terminal.as_mut()
+    }
+
+    fn tab_events(&self) -> Option<&Receiver<Event>> {
+        self.tabs.get(self.active_index())?.events.as_ref()
+    }
+
+    fn tab_session(&self) -> Option<&Session> {
+        self.tabs.get(self.active_index())?.session.as_ref()
+    }
+
+    fn tab_session_mut(&mut self) -> Option<&mut Session> {
+        let index = self.active_index();
+        self.tabs.get_mut(index)?.session.as_mut()
+    }
+
+    /// 标签栏上每个标签的标题（绘制与命中判定共用同一份）。
+    fn tab_titles(&self) -> Vec<&str> {
+        self.tabs
+            .iter()
+            .map(|tab| tab.title.as_str())
+            .collect::<Vec<_>>()
+    }
+
+    /// 新建一个标签并切过去。会话在 `apply_size` 里按新尺寸拉起。
+    fn open_tab(&mut self, hwnd: HWND) {
+        // 序号取最小可用值：关掉 shell 2 之后新建，不该又叫 shell 2。
+        let mut index = self.tabs.len() + 1;
+        while self
+            .tabs
+            .iter()
+            .any(|tab| tab.title == format!("shell {index}"))
+        {
+            index += 1;
+        }
+        self.tabs.push(Tab::new(&format!("shell {index}")));
+        self.active_tab = self.tabs.len() - 1;
+        diag::info(&format!("新建标签: {}", self.tabs[self.active_tab].title));
+        // 新标签没有网格，先按当前尺寸建一个，再拉会话。
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("新标签测量失败: {err:#}"));
+        }
+        if let Err(err) = self.spawn_session(hwnd) {
+            diag::warn(&format!("新标签启动 shell 失败: {err:#}"));
+        }
+        if let Some(report) = Some(dock::focus_state(hwnd)) {
+            self.focused = report.focus_set;
+            self.blink.set_enabled(report.focus_set);
+        }
+        self.dirty = true;
+    }
+
+    /// 关掉一个标签。关掉最后一个时保留一个空标签并写明怎么重开。
+    fn close_tab(&mut self, index: usize, hwnd: HWND) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let title = self.tabs[index].title.clone();
+        let mut removed = self.tabs.remove(index);
+        diag::info(&format!("关闭标签: {title}"));
+        // `Session::drop` 会 kill 并 join 读线程，而那个 join 没有超时：
+        // 直接在 UI 线程里丢，读线程一旦卡在 ReadFile 上，整个窗口就冻死
+        // （实测：点 × 之后点击全部无响应，日志也停了）。丢到后台线程去收尾。
+        if let Some(session) = removed.session.take() {
+            std::thread::spawn(move || drop(session));
+        }
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab::new("shell 1"));
+            self.active_tab = 0;
+            self.status = Some("没有终端了：Ctrl+Shift+T 新建".to_owned());
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("切换标签后重排失败: {err:#}"));
+        }
+        // 顶上来的标签可能从没起过会话（关掉最后一个标签时的 shell 1），
+        // 不补这一下，打字就没有进程接收。
+        if self.tab_session().is_none() {
+            if let Err(err) = self.spawn_session(hwnd) {
+                diag::warn(&format!("标签关闭后启动 shell 失败: {err:#}"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// 切到指定标签。
+    fn switch_tab(&mut self, index: usize, hwnd: HWND) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+        self.active_tab = index;
+        diag::info(&format!("切到标签: {}", self.tabs[index].title));
+        // 新标签可能还没有网格/会话（从没显示过），补建并同步尺寸。
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("切换标签后重排失败: {err:#}"));
+        }
+        if self.tab_session().is_none() {
+            if let Err(err) = self.spawn_session(hwnd) {
+                diag::warn(&format!("切换标签后启动 shell 失败: {err:#}"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// 清屏：只清看得见的屏幕与滚动缓冲，不动 shell 里正在跑的东西。
+    ///
+    /// 走 VT 序列而不是直接重置网格，是为了让「清屏」与 shell 自己发 `clear`
+    /// 得到完全一样的结果（`CSI 3J` 清回滚、`CSI 2J` 清屏、`CSI H` 光标回原点）。
+    fn clear_screen(&mut self) {
+        if let Some(term) = self.tab_terminal_mut() {
+            term.feed(b"\x1b[3J\x1b[2J\x1b[H");
+            term.scroll_to_bottom();
+        }
+        self.dirty = true;
+        diag::info("清屏");
     }
 
     #[allow(dead_code)] // M5 单实例与重挂使用
@@ -382,6 +544,11 @@ impl App {
         unsafe {
             SetTimer(Some(hwnd), TIMER_TICK, TICK_MS, None);
         }
+        if self.open_panel_at_startup {
+            // 视觉取证：面板本身也要落一张图，所以启动就展开它。
+            self.open_settings();
+            self.dirty = true;
+        }
         if self.input_probe {
             // 等 shell 起完、首帧画完再注入，否则点击落在还没准备好的窗口上。
             // 真实探针从「抬到最前」开始：不先拿到前台，后续事件会打进别人的窗口。
@@ -445,8 +612,7 @@ impl App {
             probe::Phase::Drag => {
                 let posted = probe::post_drag(self.hwnd);
                 let selection = self
-                    .terminal
-                    .as_ref()
+                    .tab_terminal()
                     .and_then(|term| term.selection_range())
                     .map(|(start, end)| {
                         format!(
@@ -482,6 +648,8 @@ impl App {
                     );
                     self.real_probe = false;
                     self.probe = None;
+                    // 必须收尾退出：诊断进程若在这里停住，调用方 `-Wait` 会永远挂。
+                    self.finish_probe_run();
                 }
             },
             probe::Phase::RealClick => {
@@ -525,6 +693,20 @@ impl App {
                     probe::Phase::RealReport,
                     &format!("真实输入结算: 点击={clicks} 按键={keydowns} 写入 PTY={written} 字节"),
                 );
+                // 输入法状态是「用户本机装了什么输入法」的事实，自动化替代不了。
+                // 印出来之后，用户切到搜狗/微软拼音各跑一次就能确认判据读到的值。
+                let key = |value: Option<u32>| match value {
+                    Some(mode) => format!("0x{mode:04x}"),
+                    None => "不可读".to_owned(),
+                };
+                probe::note(
+                    probe::Phase::RealReport,
+                    &format!(
+                        "输入法状态: 转换模式={} 原生输入={}",
+                        key(crate::win::ime::conversion_mode(self.hwnd)),
+                        crate::win::ime::wants_native_input(self.hwnd)
+                    ),
+                );
                 self.real_probe = false;
                 self.probe_previous_foreground = 0;
                 self.probe = None;
@@ -541,6 +723,7 @@ impl App {
                     "IME 去重自检: 第一次写入={first} 字节 第二次写入={second} 字节 去重={}",
                     second == 0
                 ));
+                self.finish_probe_run();
             }
             probe::Phase::Report => {
                 let state = dock::focus_state(self.hwnd);
@@ -555,8 +738,19 @@ impl App {
                 );
                 probe::restore_foreground(self.probe_previous_foreground);
                 self.probe = None;
+                self.finish_probe_run();
             }
         }
+    }
+
+    /// 自检跑完就退出。
+    ///
+    /// 诊断进程没有常驻的理由：留着只会让执行器等超时，还会占住前台还原的时机。
+    /// 延后一拍再退出，让最后一帧（含 `--dump-frame` 的落盘）先画完。
+    fn finish_probe_run(&mut self) {
+        self.probe = None;
+        self.dirty = true;
+        self.quit_due = Some(Instant::now() + Duration::from_millis(600));
     }
 
     fn schedule_probe(&mut self, phase: probe::Phase, delay_ms: u64) {
@@ -567,7 +761,7 @@ impl App {
     }
 
     fn spawn_session(&mut self, hwnd: HWND) -> Result<()> {
-        if self.session.is_some() {
+        if self.tab_session().is_some() {
             return Ok(());
         }
         let resolved =
@@ -634,7 +828,9 @@ impl App {
         match Session::spawn(options) {
             Ok(session) => {
                 diag::info(&format!("shell pid={}", session.pid()));
-                self.session = Some(session);
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.session = Some(session);
+                }
             }
             Err(err) => {
                 diag::error(&format!("PTY 启动失败: {err:#}"));
@@ -647,7 +843,7 @@ impl App {
 
     /// 把错误写进终端网格本身——比弹窗温和，也不会挡住桌面。
     fn show_terminal_error(&mut self, message: &str) {
-        let Some(term) = self.terminal.as_mut() else {
+        let Some(term) = self.tab_terminal_mut() else {
             // 终端还没建好（启动早期失败）时不能静默丢弃：退化成常驻状态行，
             // 否则用户只看到一个空白窗口，不知道发生了什么（V-32）。
             self.set_status(message.to_owned());
@@ -685,20 +881,25 @@ impl App {
 
         let window_dpi = dpi::window_dpi(hwnd);
         let padding = dpi::scale(self.config.window.padding, dpi::BASE_DPI, window_dpi);
-        let layout = Layout::compute(cell_w, cell_h, padding, ascent, width, height);
+        // 顶部要留出标签栏；它不属于网格，但「第 0 行在哪」必须一次算清。
+        let bar_h = crate::render::layout::tab_bar_height(cell_h);
+        let layout =
+            Layout::compute_with_inset(cell_w, cell_h, padding, ascent, width, height, bar_h);
         self.layout = layout;
 
         let size = TermSize::new(layout.cols, layout.rows);
-        match self.terminal.as_mut() {
+        match self.tab_terminal_mut() {
             Some(term) => term.resize(size),
             None => {
                 let (term, rx) = Terminal::new(size, 10_000, osc52_mode(&self.config));
-                self.terminal = Some(term);
-                self.term_events = Some(rx);
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.terminal = Some(term);
+                    tab.events = Some(rx);
+                }
             }
         }
 
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.tab_session() {
             let pixel_width = (layout.cols * cell_w as usize).min(u16::MAX as usize) as u16;
             let pixel_height = (layout.rows * cell_h as usize).min(u16::MAX as usize) as u16;
             if let Err(err) = session.resize(
@@ -802,10 +1003,7 @@ impl App {
     /// 把客户区坐标换算成网格坐标（行号已扣掉历史回滚偏移）。
     fn cell_at(&self, x: i32, y: i32) -> Option<Point> {
         let (column, row) = self.layout.hit(x, y)?;
-        let offset = self
-            .terminal
-            .as_ref()
-            .map_or(0, |term| term.display_offset());
+        let offset = self.tab_terminal().map_or(0, |term| term.display_offset());
         let line = row as i32 - offset as i32;
         Some(Point::new(Line(line), Column(column)))
     }
@@ -821,7 +1019,7 @@ impl App {
             "开始选择 @ ({x},{y}) -> line={} col={}",
             point.line.0, point.column.0
         ));
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.tab_terminal_mut() {
             term.start_selection(point);
         }
         self.selecting = true;
@@ -841,7 +1039,7 @@ impl App {
             diag::debug(&format!("({x},{y}) 落在网格外，忽略"));
             return;
         };
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.tab_terminal_mut() {
             term.update_selection(point);
             diag::debug(&format!(
                 "扩展选择 -> line={} col={} 选区={:?}",
@@ -866,11 +1064,7 @@ impl App {
 
     /// 把当前选区写进剪贴板，然后清掉选区。
     fn copy_selection(&mut self) {
-        let Some(text) = self
-            .terminal
-            .as_ref()
-            .and_then(|term| term.selection_text())
-        else {
+        let Some(text) = self.tab_terminal().and_then(|term| term.selection_text()) else {
             return;
         };
         if text.is_empty() {
@@ -880,7 +1074,7 @@ impl App {
             Ok(()) => diag::info(&format!("已复制 {} 个字符", text.chars().count())),
             Err(err) => diag::warn(&format!("复制到剪贴板失败: {err:#}")),
         }
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.tab_terminal_mut() {
             term.clear_selection();
         }
         self.dirty = true;
@@ -891,7 +1085,7 @@ impl App {
         if lines == 0 {
             return;
         }
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.tab_terminal_mut() {
             term.scroll(lines);
         }
         self.dirty = true;
@@ -901,7 +1095,7 @@ impl App {
 
     /// 把输入法的候选窗口挪到光标处，否则它会固定出现在窗口左上角。
     fn position_ime(&self, hwnd: HWND) {
-        let (Some(term), Some(painter)) = (self.terminal.as_ref(), self.painter.as_ref()) else {
+        let (Some(term), Some(painter)) = (self.tab_terminal(), self.painter.as_ref()) else {
             return;
         };
         let point = term.cursor_point();
@@ -1017,12 +1211,12 @@ impl App {
 
     /// 取走 PTY 输出并喂给 VT 状态机，然后处理终端事件。
     fn pump_pty(&mut self) {
-        let chunks = match self.session.as_ref() {
+        let chunks = match self.tab_session() {
             Some(session) => session.drain(),
             None => return,
         };
         if !chunks.is_empty() {
-            if let Some(term) = self.terminal.as_mut() {
+            if let Some(term) = self.tab_terminal_mut() {
                 for chunk in chunks {
                     term.feed(&chunk);
                 }
@@ -1031,7 +1225,7 @@ impl App {
         }
 
         let mut events = Vec::new();
-        if let Some(rx) = self.term_events.as_ref() {
+        if let Some(rx) = self.tab_events() {
             while let Ok(event) = rx.try_recv() {
                 events.push(event);
             }
@@ -1055,9 +1249,11 @@ impl App {
                 // 直接 `PostQuitMessage` 会让窗口瞬间消失，用户看不到退出码，
                 // 也看不到最后那几行输出（视觉验收 V-30 / V-32）。
                 // 现在改成：留下窗口、把退出码写成常驻状态行、等用户 `Ctrl+Shift+R`。
-                let code = self.session.as_mut().and_then(Session::try_exit_code);
+                let code = self.tab_session_mut().and_then(Session::try_exit_code);
                 diag::info(&format!("shell 已退出，退出码 {code:?}"));
-                self.session = None;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.session = None;
+                }
                 self.set_status(match code {
                     Some(code) => format!(
                         "shell 已退出：{} — Ctrl+Shift+R 重新打开",
@@ -1081,13 +1277,13 @@ impl App {
             diag::debug(&format!("自检写入 {} 字节: {:?}", bytes.len(), bytes));
         }
         // 一边往回翻历史一边敲键盘，说明用户想回到当前输出，先跳回底部。
-        if let Some(term) = self.terminal.as_mut() {
+        if let Some(term) = self.tab_terminal_mut() {
             if term.display_offset() > 0 {
                 term.scroll_to_bottom();
                 self.dirty = true;
             }
         }
-        let Some(session) = self.session.as_mut() else {
+        let Some(session) = self.tab_session_mut() else {
             return;
         };
         if let Err(err) = session.write(bytes) {
@@ -1142,6 +1338,35 @@ impl App {
         };
         let mut next = self.config.clone();
         panel.apply(&mut next);
+        // 「随 Windows 启动」不是配置文件里的字段，而是注册表状态：按面板当前值
+        // 去登记/取消，失败要在提示条上说清楚（自启动没开成，用户下次开机会发现
+        // 窗口不见了，这必须当场可见）。
+        let mut autostart_note: Option<String> = None;
+        if let Some(want) = panel.autostart_requested() {
+            if want != crate::win::autostart::is_enabled() {
+                let changed = if want {
+                    match std::env::current_exe() {
+                        Ok(exe) => crate::win::autostart::enable(&exe),
+                        Err(err) => {
+                            diag::error(&format!("取不到当前可执行文件路径: {err}"));
+                            false
+                        }
+                    }
+                } else {
+                    crate::win::autostart::disable()
+                };
+                let now = crate::win::autostart::is_enabled();
+                if now == want && changed {
+                    diag::info(&crate::win::autostart::describe());
+                } else {
+                    diag::warn("自启动登记失败，注册表未按预期改变");
+                    autostart_note = Some(format!(
+                        "自启动没有改成功（现在：{}）",
+                        if now { "开" } else { "关" }
+                    ));
+                }
+            }
+        }
         match self.config_path.clone() {
             Some(path) => match crate::config::save_atomic(&next, &path) {
                 Ok(()) => {
@@ -1165,7 +1390,10 @@ impl App {
                         self.blink.set_enabled(report.focus_set);
                         diag::info(&format!("设置后提到最前: {}", report.describe()));
                     }
-                    self.set_overlay("设置已保存");
+                    self.set_overlay(match autostart_note {
+                        Some(note) => note,
+                        None => "设置已保存".to_owned(),
+                    });
                 }
                 Err(err) => {
                     // 写盘失败要说出来，并且**不**关面板：用户还能改回去重试。
@@ -1284,6 +1512,13 @@ impl App {
             if text.is_empty() {
                 return;
             }
+            // 输入法处在中文/假名模式时，这几个字母是它的拼音素材，不是终端输入。
+            // 搜狗不写 `GCS_COMPSTR`，只靠 `is_composing` 判不出来——那正是
+            // 「拼音打一遍、回车中文又一遍」的成因。
+            if crate::win::ime::wants_native_input(self.hwnd) {
+                diag::debug("输入法中文模式，字母不写 PTY");
+                return;
+            }
             for ch in text.chars() {
                 self.send_char(ch);
             }
@@ -1298,10 +1533,7 @@ impl App {
         // Ctrl+C 有双重语义：有选区时是「复制」，没选区时才是中断。
         // 计划书与安全评审 S-13 都要求这两件事不共用同一次按键语义。
         if mods.ctrl && !mods.alt && matches!(key, Key::Char('c') | Key::Char('C')) {
-            let has_selection = self
-                .terminal
-                .as_ref()
-                .is_some_and(|term| term.has_selection());
+            let has_selection = self.tab_terminal().is_some_and(|term| term.has_selection());
             if has_selection {
                 self.copy_selection();
                 return;
@@ -1312,9 +1544,42 @@ impl App {
             self.paste_from_clipboard();
             return;
         }
+        // 标签与清屏：都放在编码之前拦下，别把 Ctrl+T 变成 `0x14` 写进 shell。
+        if mods.ctrl && !mods.alt {
+            match key {
+                Key::Char('t') | Key::Char('T') => {
+                    let hwnd = self.hwnd;
+                    self.open_tab(hwnd);
+                    return;
+                }
+                Key::Char('w') | Key::Char('W') => {
+                    let hwnd = self.hwnd;
+                    let index = self.active_index();
+                    self.close_tab(index, hwnd);
+                    return;
+                }
+                Key::Char('l') | Key::Char('L') => {
+                    self.clear_screen();
+                    return;
+                }
+                Key::Tab => {
+                    let hwnd = self.hwnd;
+                    let count = self.tabs.len();
+                    if count > 1 {
+                        let next = if mods.shift {
+                            (self.active_index() + count - 1) % count
+                        } else {
+                            (self.active_index() + 1) % count
+                        };
+                        self.switch_tab(next, hwnd);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let mode = self
-            .terminal
-            .as_ref()
+            .tab_terminal()
             .map(|term| term.mode())
             .unwrap_or_else(TermMode::empty);
         if let Some(bytes) = input::encode(key, mods, mode) {
@@ -1401,7 +1666,12 @@ impl App {
     /// 按配置沉底；关闭时什么都不做（窗口留在普通 z-order 里）。
     fn maybe_sink(&self, hwnd: HWND) {
         if self.sinks() {
-            dock::send_to_bottom(hwnd);
+            let ok = dock::send_to_bottom(hwnd);
+            diag::info(&format!(
+                "沉底: ok={ok} 下方窗口={} 紧邻下方={}",
+                dock::windows_below(hwnd),
+                dock::next_below_class(hwnd)
+            ));
         }
     }
 
@@ -1446,7 +1716,7 @@ impl App {
     ///
     /// 退出码留在滚动缓冲区里不擦，所以重开之后还能看见上一条命令的结果。
     fn restart_session(&mut self) {
-        if self.session.is_some() {
+        if self.tab_session().is_some() {
             return;
         }
         self.clear_status();
@@ -1511,8 +1781,7 @@ impl App {
         }
 
         let bracketed = self
-            .terminal
-            .as_ref()
+            .tab_terminal()
             .is_some_and(|term| term.mode().contains(TermMode::BRACKETED_PASTE));
         let bytes = paste::bytes_for_pty(&clean, bracketed);
         diag::info(&format!("写入粘贴内容 {} 字节", bytes.len()));
@@ -1523,6 +1792,16 @@ impl App {
     }
 
     fn tick(&mut self) {
+        // 自检收尾：把最后一帧画完再退出，别让执行器干等超时。
+        if let Some(due) = self.quit_due {
+            if Instant::now() >= due {
+                self.quit_due = None;
+                // SAFETY: PostQuitMessage 只往本线程队列投一条 WM_QUIT。
+                unsafe { PostQuitMessage(0) };
+                return;
+            }
+            self.dirty = true;
+        }
         // 待落盘期间保持重绘：否则网格内容变了也不会再走 render，落盘会停在旧帧。
         if self.dump_frame.is_some() && !self.dump_done {
             self.dirty = true;
@@ -1556,9 +1835,11 @@ impl App {
 
         // 子进程退出不再关窗：留下窗口、把退出码写成常驻状态行（V-30）。
         // 关闭动作交给 `Ctrl+Alt+Q`，用户还能看清最后几行与退出码。
-        if let Some(code) = self.session.as_mut().and_then(Session::try_exit_code) {
+        if let Some(code) = self.tab_session_mut().and_then(Session::try_exit_code) {
             diag::info(&format!("检测到子进程退出，退出码 {code}"));
-            self.session = None;
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.session = None;
+            }
             self.set_status(format!(
                 "shell 已退出（退出码 {code}）— Ctrl+Shift+R 重新打开"
             ));
@@ -1572,31 +1853,63 @@ impl App {
     }
 
     fn render(&mut self) {
-        // 面板数据必须在借出 painter/surface 之前取好：它们都是 `self` 的字段，
+        // 面板/标签数据必须在借出 painter/surface 之前取好：它们都是 `self` 的字段，
         // 一起可变借用以后就不能再回头读 `self.settings`。
         let panel_view = self
             .settings
             .as_ref()
             .filter(|panel| !panel.is_empty())
             .map(|panel| (panel.rows(), panel.selected, panel.dirty));
-        let (Some(painter), Some(surface), Some(term)) = (
-            self.painter.as_mut(),
-            self.surface.as_mut(),
-            self.terminal.as_ref(),
-        ) else {
+        // 标题取一份副本：绘制期间还要可变借用 `self.tabs`（借的是同一块内存，
+        // 留着 `&str` 会被借用检查器当成冲突）。
+        let tab_titles: Vec<(String, bool)> = {
+            let active = self.active_index();
+            self.tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| (tab.title.clone(), index == active))
+                .collect()
+        };
+        let bar_h = crate::render::layout::tab_bar_height(self.layout.cell_h);
+        // 临时提示优先于常驻状态行：告警过去之后状态行自己会回来。
+        let overlay_text = self
+            .overlay
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .or_else(|| self.status.clone());
+        let flags = crate::render::painter::DrawFlags {
+            cursor_visible: self.blink.visible(),
+            focused: self.focused,
+            elevated: self.elevated,
+        };
+        let radius = dpi::scale(
+            self.config.window.border_radius,
+            dpi::BASE_DPI,
+            dpi::window_dpi(self.hwnd),
+        ) as f32;
+        // 背景透明度与文字透明度分开：前者只铺底，后者只乘字形覆盖度。
+        let bg_alpha = (self.config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let text_alpha = (self.config.window.text_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let layout = self.layout;
+        let hwnd = self.hwnd;
+
+        // 逐个字段借，别借整个 `self`：`tab_views` 里还拿着 `self.tabs` 的引用。
+        let App {
+            painter,
+            surface,
+            tabs,
+            active_tab,
+            ..
+        } = self;
+        let (Some(painter), Some(surface)) = (painter.as_mut(), surface.as_mut()) else {
             return;
         };
         let (width, height) = surface.size();
         if width == 0 || height == 0 {
             return;
         }
-
-        let radius = dpi::scale(
-            self.config.window.border_radius,
-            dpi::BASE_DPI,
-            dpi::window_dpi(self.hwnd),
-        ) as f32;
-        let opacity = self.config.window.opacity;
+        let active = (*active_tab).min(tabs.len().saturating_sub(1));
+        let term = tabs.get(active).and_then(|tab| tab.terminal.as_ref());
         {
             let pixels: &mut [u32] = surface.pixels_mut();
             let mut frame = crate::render::Frame {
@@ -1604,6 +1917,8 @@ impl App {
                 width,
                 height,
             };
+            painter.bg_alpha = bg_alpha;
+            painter.text_alpha = text_alpha;
             if let Some((rows, selected, dirty)) = panel_view {
                 let footer = if dirty {
                     "未保存 · ↑↓ 选择 ←→ 调整 Enter 保存 Esc 取消"
@@ -1612,7 +1927,7 @@ impl App {
                 };
                 painter.draw_panel(
                     &mut frame,
-                    &self.layout,
+                    &layout,
                     &crate::render::painter::Panel {
                         title: "设置",
                         rows,
@@ -1622,29 +1937,28 @@ impl App {
                     },
                 );
             } else {
-                // 临时提示优先于常驻状态行：告警过去之后状态行自己会回来。
-                let overlay = self
-                    .overlay
-                    .as_ref()
-                    .map(|(text, _)| text.as_str())
-                    .or(self.status.as_deref());
-                painter.draw(
-                    &mut frame,
-                    &self.layout,
-                    term,
-                    crate::render::painter::DrawFlags {
-                        cursor_visible: self.blink.visible(),
-                        focused: self.focused,
-                        elevated: self.elevated,
-                    },
-                    overlay,
-                );
+                match term {
+                    Some(term) => {
+                        painter.draw(&mut frame, &layout, term, flags, overlay_text.as_deref())
+                    }
+                    // shell 退出后没有网格：仍然画一屏，别留一块没刷过的透明面。
+                    None => painter.draw_idle(&mut frame, &layout, flags, overlay_text.as_deref()),
+                }
+                let tab_views: Vec<crate::render::painter::TabView<'_>> = tab_titles
+                    .iter()
+                    .map(|(title, active)| crate::render::painter::TabView {
+                        title: title.as_str(),
+                        active: *active,
+                    })
+                    .collect();
+                painter.draw_tab_bar(&mut frame, &layout, bar_h, &tab_views, flags.focused);
             }
         }
-        if let Err(err) = surface.present(self.hwnd, radius, opacity) {
+        if let Err(err) = surface.present(hwnd, radius) {
             diag::warn(&format!("UpdateLayeredWindow 失败: {err:#}"));
             return;
         }
+        let was_done = self.dump_done;
         Self::maybe_dump(
             self.dump_frame.as_ref(),
             self.dump_bg,
@@ -1654,6 +1968,16 @@ impl App {
             width,
             height,
         );
+        // 取证跑完就退出：`--dump-frame` 是一次性诊断，不该常驻桌面。
+        // （自检类运行自己会设 quit_due，这里只补「单纯落盘」那条路径。）
+        if !was_done
+            && self.dump_done
+            && self.quit_due.is_none()
+            && !self.real_probe
+            && !self.input_probe
+        {
+            self.quit_due = Some(Instant::now() + Duration::from_millis(600));
+        }
     }
 
     /// 到点就把刚推给系统的同一份像素写成 BMP（`--dump-frame`）。
@@ -1880,6 +2204,11 @@ impl App {
                 self.focused = true;
                 self.blink.set_enabled(true);
                 self.dirty = true;
+                // 焦点到手但窗口仍留在最底层（沉底模式）。激活与叠放次序是两件事，
+                // 用户明确要求「始终在所有窗口之下」。
+                if self.sinks() {
+                    dock::send_to_bottom(hwnd);
+                }
                 Some(LRESULT(0))
             }
             WM_KILLFOCUS => {
@@ -1905,9 +2234,47 @@ impl App {
                 if self.real_probe {
                     self.real_events.0 += 1;
                 }
+                // 标签栏先判：那是导航条，不是网格。落在栏上就不该起选区，
+                // 否则点标签会顺手把第一行文字选中。
+                let (click_x, click_y) = client_point(lparam);
+                let bar_h = crate::render::layout::tab_bar_height(self.layout.cell_h);
+                if click_y >= 0 && click_y < bar_h {
+                    let hit = {
+                        let titles = self.tab_titles();
+                        crate::render::layout::hit_tab_bar(self.layout.cell_w, &titles, click_x)
+                    };
+                    match hit {
+                        crate::render::layout::TabHit::Select(index) => {
+                            self.switch_tab(index, hwnd);
+                        }
+                        crate::render::layout::TabHit::Close(index) => {
+                            self.close_tab(index, hwnd);
+                        }
+                        crate::render::layout::TabHit::New => self.open_tab(hwnd),
+                        crate::render::layout::TabHit::Clear => self.clear_screen(),
+                        crate::render::layout::TabHit::Blank => {}
+                    }
+                    // 点完导航条仍然要拿到键盘：用户的下一动作一定是打字。
+                    let report = dock::take_keyboard_focus(hwnd);
+                    self.focused = report.focus_set;
+                    self.blink.set_enabled(report.focus_set);
+                    diag::info(&format!(
+                        "点击标签栏 @({click_x},{click_y}) 栏高={bar_h} 单元格={}: {:?} {}",
+                        self.layout.cell_w,
+                        hit,
+                        report.describe()
+                    ));
+                    return Some(LRESULT(0));
+                }
                 // 点一下就把前台与键盘都拿回来，然后立刻回读校验。
                 let report = dock::take_keyboard_focus(hwnd);
                 diag::info(&format!("点击取焦点: {}", report.describe()));
+                // 沉底模式：拿到键盘之后立刻把 z-order 压回最底。
+                // 用户要的是「它永远在所有窗口之下」，而不是「点一下就把桌面挡住」；
+                // 两者可以同时成立——前台窗口照样收键盘，叠放次序仍在最底。
+                if self.sinks() {
+                    dock::send_to_bottom(hwnd);
+                }
                 self.focused = report.focus_set;
                 self.blink.set_enabled(report.focus_set);
                 self.begin_selection(hwnd, lparam);
@@ -2047,7 +2414,12 @@ impl App {
                 unsafe {
                     let _ = KillTimer(Some(hwnd), TIMER_TICK);
                 }
-                self.session = None;
+                for tab in &mut self.tabs {
+                    // 同上：退出路径也不能在 UI 线程 join 读线程。
+                    if let Some(session) = tab.session.take() {
+                        std::thread::spawn(move || drop(session));
+                    }
+                }
                 // SAFETY: PostQuitMessage 只投递线程消息。
                 unsafe { PostQuitMessage(0) };
                 Some(LRESULT(0))
@@ -2230,16 +2602,42 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRES
     unsafe { window::default_proc(hwnd, msg, wparam, lparam) }
 }
 
+/// 一次运行的输入参数。
+///
+/// 打包成结构体是因为诊断开关一直在增加：八个位置参数既难看也容易被调换，
+/// clippy 的 `too_many_arguments` 也在这儿拦了一道。
+pub struct RunOptions {
+    pub config: Config,
+    pub rect: Option<dpi::Rect>,
+    /// `--probe-input`：进程内 `PostMessage` 自检。
+    pub input_probe: bool,
+    /// `--probe-real`：`SendInput` 真实事件自检。
+    pub real_probe: bool,
+    /// `--dump-frame`：把首帧落盘成 BMP。
+    pub dump_frame: Option<std::path::PathBuf>,
+    /// `--dump-bg`：落盘时的合成底色。
+    pub dump_bg: Option<u32>,
+    /// `--config` 指定的保存目标。
+    pub config_path: Option<std::path::PathBuf>,
+    /// `--open-settings`：启动即展开面板（视觉取证）。
+    pub open_settings: bool,
+    /// UI 自动化测试模式：不沉底、不自动退出，只给验收脚本用。
+    pub ui_test: bool,
+}
+
 /// 启动消息循环，返回进程退出码。
-pub fn run(
-    config: Config,
-    rect: Option<dpi::Rect>,
-    input_probe: bool,
-    real_probe: bool,
-    dump_frame: Option<std::path::PathBuf>,
-    dump_bg: Option<u32>,
-    config_path: Option<std::path::PathBuf>,
-) -> Result<i32> {
+pub fn run(options: RunOptions) -> Result<i32> {
+    let RunOptions {
+        config,
+        rect,
+        input_probe,
+        real_probe,
+        dump_frame,
+        dump_bg,
+        config_path,
+        open_settings,
+        ui_test,
+    } = options;
     let hinstance = window::module_handle()?;
     window::register_class(hinstance, wndproc)?;
 
@@ -2268,12 +2666,16 @@ pub fn run(
     if let Some(path) = config_path {
         app_owned.config_path = Some(path);
     }
+    app_owned.open_panel_at_startup = open_settings;
+    if ui_test {
+        // 验收脚本用 PostMessage 点击控件；沉底状态下真实点击拿不到前台，
+        // 所以测试模式强制不沉底。这不是产品默认行为，正常启动不会走到这里。
+        app_owned.config.window.sink_when_unfocused = false;
+        diag::info("UI 测试模式：强制不沉底、不自动退出");
+    }
     if real_probe {
         app_owned.enable_real_probe();
     } else if input_probe {
-        app_owned.enable_input_probe();
-    }
-    if input_probe {
         app_owned.enable_input_probe();
     }
     let app: &'static mut App = Box::leak(Box::new(app_owned));
@@ -2291,8 +2693,19 @@ pub fn run(
     if !dock::is_top_level(hwnd) {
         diag::warn("窗口不是顶层窗口：键盘焦点可能永远拿不到");
     }
-    if app.sinks() && !dock::send_to_bottom(hwnd) {
-        app.startup_warnings.push("桌面层沉底失败".to_owned());
+    if app.sinks() {
+        // 「沉底」不能只看 SetWindowPos 的返回值：它成功不代表真的到了最底。
+        // `windows_below` 数的是自己下面还剩几个窗口，真到底时必须是 0，
+        // 这行日志就是执行器能断言的证据。
+        let ok = dock::send_to_bottom(hwnd);
+        diag::info(&format!(
+            "启动沉底: ok={ok} 下方窗口={} 紧邻下方={}",
+            dock::windows_below(hwnd),
+            dock::next_below_class(hwnd)
+        ));
+        if !ok {
+            app.startup_warnings.push("桌面层沉底失败".to_owned());
+        }
     }
 
     // `UpdateLayeredWindow` 的前置条件：窗口必须带 WS_EX_LAYERED（`create` 已设，
