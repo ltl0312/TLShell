@@ -25,15 +25,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostQuitMessage,
-    RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE,
-    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
-    HTTOPRIGHT, MA_ACTIVATE, MSG, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_ACTIVATE,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_IME_CHAR, WM_IME_COMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_PAINT,
-    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer,
+    LoadCursorW, PostQuitMessage, RegisterWindowMessageW, SetCursor, SetTimer, ShowWindow,
+    TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MA_ACTIVATE, MSG, SW_HIDE,
+    SW_SHOW, SW_SHOWNOACTIVATE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CREATE,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY,
+    WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
 };
 
 use crate::config::{Config, FONT_SIZE_MAX, FONT_SIZE_MIN};
@@ -158,6 +159,145 @@ impl Tab {
     }
 }
 
+/// 切换终端的一个候选项：写进配置的名字 + 弹窗上给人看的名字。
+#[derive(Debug, Clone, Copy)]
+struct ShellChoice {
+    /// 写进 `shell.program` 的裸文件名，交给 [`shell::resolve`] 的白名单解析。
+    program: &'static str,
+    /// 弹窗里显示的说明（带上版本，用户才知道 pwsh 与 powershell 的区别）。
+    label: &'static str,
+}
+
+/// 候选集合：新 → 旧 → 最旧，也是「前一个终端」这个直觉的顺序。
+const SHELL_CHOICES: [ShellChoice; 3] = [
+    ShellChoice {
+        program: "pwsh.exe",
+        label: "pwsh · PowerShell 7",
+    },
+    ShellChoice {
+        program: "powershell.exe",
+        label: "powershell · Windows 5.1",
+    },
+    ShellChoice {
+        program: "cmd.exe",
+        label: "cmd · 命令提示符",
+    },
+];
+
+/// 切换终端弹窗：先选终端类型，再选「新开标签」还是「原地切换」。
+///
+/// 为什么要有弹窗：标签栏那个按钮原来是点一下就悄悄重启 shell，
+/// 用户既不知道会切到哪一类终端，也不知道现有记录会不会被清掉。
+/// 这两件事都必须让用户当场看得见、点得动。
+struct ShellPicker {
+    /// 本机真正能起来的候选（解析失败的直接不列，避免选了必然失败）。
+    choices: Vec<ShellChoice>,
+    /// 选中的候选下标。
+    choice: usize,
+    /// 是否新开标签：`false` = 原地换 shell，保留当前记录。
+    new_session: bool,
+    /// 焦点行：0 = 终端类型，1 = 切换方式。
+    focus: usize,
+}
+
+impl ShellPicker {
+    /// 按可用性过滤候选；一个都不剩时返回 `None`（不弹空窗）。
+    fn available(shell_config: &crate::config::ShellConfig, allow_custom: bool) -> Option<Self> {
+        let choices: Vec<ShellChoice> = SHELL_CHOICES
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                // 只改一份副本去探测：别人的 args 保持原样，当前配置一个字都不动。
+                let mut probe = shell_config.clone();
+                probe.program = candidate.program.to_owned();
+                shell::resolve(&probe, allow_custom).is_ok()
+            })
+            .collect();
+        if choices.is_empty() {
+            return None;
+        }
+        // 默认停在当前类型上：多数人打开弹窗只是想确认「现在是什么」。
+        let choice = choices
+            .iter()
+            .position(|candidate| {
+                candidate
+                    .program
+                    .eq_ignore_ascii_case(shell_config.program.as_str())
+            })
+            .unwrap_or(0);
+        Some(Self {
+            choices,
+            choice,
+            new_session: false,
+            focus: 0,
+        })
+    }
+
+    /// 面板要画的两行（与 `draw_panel` 的行序一致）。
+    fn rows(&self) -> Vec<(&'static str, String)> {
+        let label = self
+            .choices
+            .get(self.choice)
+            .map_or("—", |candidate| candidate.label);
+        let mode = if self.new_session {
+            "新开标签（另起会话）"
+        } else {
+            "原地切换（保留记录）"
+        };
+        vec![("终端", label.to_owned()), ("方式", mode.to_owned())]
+    }
+
+    /// 当前选中的候选；下标越界时退化成第一个。
+    fn selected(&self) -> Option<ShellChoice> {
+        self.choices
+            .get(self.choice)
+            .copied()
+            .or_else(|| self.choices.first().copied())
+    }
+
+    fn move_focus(&mut self, delta: i32) {
+        let last = self.rows().len().saturating_sub(1) as i32;
+        let next = self.focus as i32 + delta;
+        self.focus = next.clamp(0, last) as usize;
+    }
+
+    /// 改当前行的值：第 0 行换候选，第 1 行换方式。
+    fn adjust(&mut self, forward: bool) {
+        if self.focus == 0 {
+            self.cycle_choice(forward);
+        } else {
+            self.new_session = !self.new_session;
+        }
+    }
+
+    fn cycle_choice(&mut self, forward: bool) {
+        let len = self.choices.len();
+        if len == 0 {
+            return;
+        }
+        self.choice = if forward {
+            (self.choice + 1) % len
+        } else {
+            (self.choice + len - 1) % len
+        };
+    }
+
+    /// 鼠标点某一行：先移焦点，再像点一次那样把该行的值推到下一个。
+    fn click_row(&mut self, row: usize) {
+        self.focus = row.min(1);
+        self.adjust(true);
+    }
+}
+
+/// 一次弹窗的渲染数据：设置面板与切换终端弹窗共用同一条绘制路径。
+struct PanelView {
+    title: &'static str,
+    rows: Vec<(&'static str, String)>,
+    selected: usize,
+    footer: &'static str,
+    dirty: bool,
+}
+
 pub struct App {
     hwnd: HWND,
     config: Config,
@@ -205,6 +345,8 @@ pub struct App {
     real_events: (u32, u32, u32),
     /// 设置面板：`Some` 表示面板开着，终端不再接收按键。
     settings: Option<Settings>,
+    /// 切换终端弹窗：`Some` 表示弹窗开着，按键与鼠标点击都先归它。
+    shell_picker: Option<ShellPicker>,
     /// 进程是否处于提权态：为真时边框内侧常驻一圈警示色（S-01）。
     elevated: bool,
     /// 常驻状态行：退出码、致命错误这类「说完就不该消失」的信息。
@@ -308,6 +450,7 @@ impl App {
             real_guard: None,
             real_events: (0, 0, 0),
             settings: None,
+            shell_picker: None,
             dirty: false,
             last_render: Instant::now(),
             suppress_char_until: None,
@@ -599,67 +742,291 @@ impl App {
         }
     }
 
-    /// 循环切换当前标签的 shell 类型：pwsh → powershell → cmd → pwsh。
-    ///
-    /// 只写 `shell.program` 这一项，其余配置原样保存；切换后立刻重建这个标签的会话，
-    /// 因为 shell 是进程，改配置不可能影响已经在跑的那个。
-    fn cycle_shell(&mut self, hwnd: HWND) {
-        const CANDIDATES: [&str; 3] = ["pwsh.exe", "powershell.exe", "cmd.exe"];
-        let current = self.config.shell.program.to_ascii_lowercase();
-        fn file_name_lower(name: &str) -> String {
-            name.rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(name)
-                .to_ascii_lowercase()
-        }
-        let position = CANDIDATES
-            .iter()
-            .position(|candidate| file_name_lower(&current) == candidate.to_ascii_lowercase())
-            .unwrap_or(0);
-        let allow_custom = self.config.security.allow_custom_shell;
-        let mut chosen = None;
-        for step in 1..=CANDIDATES.len() {
-            let candidate = CANDIDATES[(position + step) % CANDIDATES.len()];
-            let mut probe = self.config.clone();
-            probe.shell.program = candidate.to_owned();
-            if shell::resolve(&probe.shell, allow_custom).is_ok() {
-                chosen = Some(candidate.to_owned());
-                break;
-            }
-        }
-        let Some(program) = chosen else {
-            diag::warn("切换 shell 失败：三个候选都不可用");
-            self.set_overlay_for("没有可切换的 shell", OVERLAY_TTL);
-            return;
-        };
-        self.config.shell.program = program.clone();
-        if let Some(path) = self.config_path.clone() {
-            match crate::config::save_atomic(&self.config, &path) {
-                Ok(()) => diag::info(&format!("shell 已切换为 {program}，配置已保存")),
-                Err(err) => diag::warn(&format!("shell 切换后写配置失败: {err:#}")),
-            }
-        }
-        self.force_restart_session(hwnd);
-        self.set_overlay_for(format!("shell 已切换为 {program}"), OVERLAY_TTL);
+    /// 指针下面那一点「点得动吗」：点得动给手型，其余按文本区处理。
+    /// 这一行是不是标签栏（导航条，不是终端网格）。
+    fn in_tab_bar(&self, y: i32) -> bool {
+        let bar_h = crate::render::layout::tab_bar_height(self.layout.cell_h);
+        y >= 0 && y < bar_h
     }
 
-    /// 不管当前会话死活都重建一次：先把它挪到后台线程回收，再起新的。
-    fn force_restart_session(&mut self, hwnd: HWND) {
+    fn over_clickable(&self, x: i32, y: i32) -> bool {
+        if self.shell_picker.is_some() {
+            // 弹窗占满整块客户区：只有行是可点的，别处不是。
+            return self.shell_picker_row_at(y).is_some();
+        }
+        if self.settings_visible() {
+            return false;
+        }
+        if !self.in_tab_bar(y) {
+            return false;
+        }
+        let bar = self.tab_bar_now();
+        !matches!(
+            crate::render::layout::hit_tab_bar(&bar, self.layout.cell_w, x),
+            crate::render::layout::TabHit::Blank
+        )
+    }
+
+    /// 按指针位置刷新系统光标。
+    ///
+    /// 为什么必须自己刷：窗口类只带一个光标，而这块客户区里既有按钮也有终端网格。
+    /// 之前类光标固定成 I-beam，于是每个按钮上都显示「文本插入符」——看起来像可以
+    /// 框选文字，谁都不敢点。现在按钮给手型，终端区仍旧是 I-beam（那里本来就能选字）。
+    fn refresh_cursor(&self, hwnd: HWND) {
+        let mut point = POINT::default();
+        // SAFETY: point 是栈上可写结构；hwnd 有效，只取指针位置。
+        unsafe {
+            if GetCursorPos(&mut point).is_err() {
+                return;
+            }
+        }
+        // 命中判定走与 WM_NCHITTEST 完全同一条路径（同一套边距），
+        // 这样边框、拖动带、按钮不会各算一套边界。
+        let packed = (((point.y as isize) & 0xffff) << 16) | ((point.x as isize) & 0xffff);
+        let code = self.hit_test(hwnd, LPARAM(packed)).0 as u32;
+        // SAFETY: 同上，只做屏幕到客户的坐标换算。
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+        let id = match code {
+            HTLEFT | HTRIGHT => IDC_SIZEWE,
+            HTTOP | HTBOTTOM => IDC_SIZENS,
+            HTTOPLEFT | HTBOTTOMRIGHT => IDC_SIZENWSE,
+            HTTOPRIGHT | HTBOTTOMLEFT => IDC_SIZENESW,
+            HTCAPTION => IDC_SIZEALL,
+            HTCLIENT if self.over_clickable(point.x, point.y) => IDC_HAND,
+            // 标签栏是导航条：不可点的空白处也不该摆出文本插入符。
+            HTCLIENT if self.in_tab_bar(point.y) => IDC_ARROW,
+            HTCLIENT => IDC_IBEAM,
+            _ => IDC_ARROW,
+        };
+        // SAFETY: id 是系统预定义光标资源名，只读。
+        let handle = unsafe { LoadCursorW(None, id) }.unwrap_or_default();
+        // SAFETY: handle 是刚取得的（最坏是空）光标句柄，交给系统只影响外观。
+        unsafe {
+            SetCursor(Some(handle));
+        }
+    }
+
+    /// 当前该画哪个弹窗：切换终端优先于设置面板。
+    fn modal_panel(&self) -> Option<PanelView> {
+        if let Some(picker) = self.shell_picker.as_ref() {
+            return Some(PanelView {
+                title: "切换终端",
+                rows: picker.rows(),
+                selected: picker.focus,
+                footer: "↑↓ 选择 ←→ 切换 Enter 确认 Esc 取消 · 也可以点行切换",
+                dirty: false,
+            });
+        }
+        let panel = self.settings.as_ref().filter(|panel| !panel.is_empty())?;
+        Some(PanelView {
+            title: "设置",
+            rows: panel.rows(),
+            selected: panel.selected,
+            footer: if panel.dirty {
+                "未保存 · ↑↓ 选择 ←→ 调整 Enter 保存 Esc 取消"
+            } else {
+                "↑↓ 选择 ←→ 调整 Enter 保存 Esc 取消"
+            },
+            dirty: panel.dirty,
+        })
+    }
+
+    /// 点标签栏的 shell 按钮：弹出切换终端的选择框。
+    ///
+    /// 原来的实现是「点一下就悄悄切到下一个类型并重启 shell」：用户既看不见会切到
+    /// 哪一类终端，也不知道手上这些记录会不会被清掉。现在一律先弹窗，两个决定
+    /// （换哪一类 / 新开还是原地）都由用户当场点明白。
+    fn open_shell_picker(&mut self) {
+        let allow_custom = self.config.security.allow_custom_shell;
+        match ShellPicker::available(&self.config.shell, allow_custom) {
+            Some(picker) => {
+                let candidates = picker.choices.len();
+                let current = self.config.shell.program.clone();
+                self.shell_picker = Some(picker);
+                self.dirty = true;
+                // 行的竖直中心一并打出来：验收脚本按这条日志点行，
+                // 脚本里不再自己算一遍几何（那是最容易和产品漂移的地方）。
+                let centers = self.picker_row_centers();
+                diag::info(&format!(
+                    "打开切换终端弹窗: {candidates} 个候选，当前 {current}，行中心={centers:?}，行高={}",
+                    self.layout.cell_h
+                ));
+            }
+            None => {
+                diag::warn("切换终端: 没有可用候选");
+                self.set_overlay_for("没有可切换的 shell，检查 shell.program 配置", OVERLAY_TTL);
+            }
+        }
+    }
+
+    /// 弹窗每一行的竖直中心（像素），供日志与验收脚本点击使用。
+    fn picker_row_centers(&self) -> Vec<i32> {
+        let rows = self
+            .shell_picker
+            .as_ref()
+            .map_or(0, |picker| picker.rows().len());
+        (0..rows)
+            .map(|index| {
+                let (_, top) = self.layout.cell_origin(0, index + 2);
+                top + self.layout.cell_h / 2
+            })
+            .collect()
+    }
+
+    fn close_shell_picker(&mut self) {
+        if self.shell_picker.take().is_some() {
+            diag::info("关闭切换终端弹窗（未确认）");
+            self.dirty = true;
+        }
+    }
+
+    /// 弹窗开着时接管按键：Esc 取消、Enter 确认、↑↓ 换行、←→ 改值。
+    fn handle_shell_picker_key(&mut self, vk: u32) {
+        const VK_ESCAPE: u32 = 0x1b;
+        const VK_RETURN: u32 = 0x0d;
+        const VK_LEFT: u32 = 0x25;
+        const VK_UP: u32 = 0x26;
+        const VK_RIGHT: u32 = 0x27;
+        const VK_DOWN: u32 = 0x28;
+        match vk {
+            VK_ESCAPE => self.close_shell_picker(),
+            VK_RETURN => {
+                let hwnd = self.hwnd;
+                self.confirm_shell_picker(hwnd);
+            }
+            VK_UP | VK_DOWN => {
+                if let Some(picker) = self.shell_picker.as_mut() {
+                    picker.move_focus(if vk == VK_DOWN { 1 } else { -1 });
+                }
+                self.dirty = true;
+            }
+            VK_LEFT | VK_RIGHT => {
+                if let Some(picker) = self.shell_picker.as_mut() {
+                    picker.adjust(vk == VK_RIGHT);
+                }
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// 弹窗里的鼠标点击：点哪一行，就把那一行的值推到下一个。
+    fn handle_shell_picker_click(&mut self, y: i32) {
+        let Some(row) = self.shell_picker_row_at(y) else {
+            // 点在空白处什么也不做：误触不该改掉用户已经选好的东西。
+            return;
+        };
+        let Some(picker) = self.shell_picker.as_mut() else {
+            return;
+        };
+        picker.click_row(row);
+        let choice = picker.selected().map_or("—", |choice| choice.program);
+        let mode = if picker.new_session {
+            "新开标签"
+        } else {
+            "原地切换"
+        };
+        self.dirty = true;
+        diag::info(&format!(
+            "切换终端弹窗: 点第 {} 行 → 终端={choice}，方式={mode}",
+            row + 1
+        ));
+    }
+
+    /// 弹窗第 `y` 像素落在哪一行（与 `draw_panel` 的行序一致：标题占第 0 行，行从第 2 行起）。
+    fn shell_picker_row_at(&self, y: i32) -> Option<usize> {
+        let rows = self
+            .shell_picker
+            .as_ref()
+            .map(|picker| picker.rows().len())?;
+        (0..rows).find(|index| {
+            let (_, top) = self.layout.cell_origin(0, index + 2);
+            y >= top && y < top + self.layout.cell_h
+        })
+    }
+
+    /// 确认弹窗：写配置，然后按用户选的「新开标签 / 原地切换」执行。
+    fn confirm_shell_picker(&mut self, hwnd: HWND) {
+        let Some(picker) = self.shell_picker.take() else {
+            return;
+        };
+        let Some(choice) = picker.selected() else {
+            return;
+        };
+        self.dirty = true;
+        let program_changed = !self
+            .config
+            .shell
+            .program
+            .eq_ignore_ascii_case(choice.program);
+        if program_changed {
+            self.config.shell.program = choice.program.to_owned();
+            self.save_config(&format!("shell 已切换为 {}，配置已保存", choice.program));
+        }
+        if picker.new_session {
+            self.open_tab(hwnd);
+            diag::info(&format!("切换终端: 新开标签 {}", choice.program));
+            self.set_overlay_for(format!("已新开标签：{}", choice.label), OVERLAY_TTL);
+        } else if !program_changed && self.tab_session().is_some() {
+            // 选回来的就是当前这一类，而且会话还活着：重启只会白丢进程状态。
+            diag::info(&format!("原地切换: 当前已经是 {}，未重启", choice.program));
+            self.set_overlay_for(format!("当前已经是 {}", choice.label), OVERLAY_TTL);
+        } else {
+            self.switch_shell_in_place(hwnd, choice);
+        }
+    }
+
+    /// 原地切换：只换 PTY 会话，**保留**当前屏幕与回滚缓冲。
+    ///
+    /// 用户的原话是「不新开会话切换终端之后之前的记录不能清空」，所以这里绝对不能走
+    /// `terminal = None` 那条路——那会把滚动历史和当前屏幕一起丢掉，等于顺手清屏。
+    fn switch_shell_in_place(&mut self, hwnd: HWND, choice: ShellChoice) {
         let index = self.active_index();
+        // 切换前的回滚深度：切换后要把它原样报出来，这是「记录没被清掉」的证据。
+        let history = self.tab_terminal().map_or(0, Terminal::history_size);
         if let Some(tab) = self.tabs.get_mut(index) {
             if let Some(session) = tab.session.take() {
                 // 会话回收可能要等 ConPTY 读线程退出，不能卡在 UI 线程上。
                 std::thread::spawn(move || drop(session));
             }
-            tab.terminal = None;
-            tab.events = None;
             tab.shell_kind = None;
         }
         self.clear_status();
-        // 失败已经由 spawn_session 自己写进状态行/日志，这里不需要再判一次。
-        let _ = self.spawn_session(hwnd);
-        let _ = self.apply_size(hwnd);
-        self.dirty = true;
+        // 一条分界线：让用户分得清「以上是切换前的输出」。
+        self.show_terminal_error(&format!(
+            "[TLShell] 已切换为 {}（上面这些记录没有清空）",
+            choice.label
+        ));
+        if let Err(err) = self.spawn_session(hwnd) {
+            diag::error(&format!("原地切换终端失败: {err:#}"));
+        }
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("切换终端后重排失败: {err:#}"));
+        }
+        let kept = self.tab_terminal().map_or(0, Terminal::history_size);
+        diag::info(&format!(
+            "原地切换: {}，屏幕与回滚历史保留（历史={} 行，切换前={history} 行）",
+            choice.program, kept
+        ));
+        self.set_overlay_for(format!("已原地切换到 {}", choice.label), OVERLAY_TTL);
+    }
+
+    /// 把当前内存里的配置写盘；失败必须在提示条上说出来，不能静默。
+    fn save_config(&mut self, note: &str) {
+        let Some(path) = self.config_path.clone() else {
+            diag::warn("配置目录不可定位，改动只在本次运行有效");
+            self.set_overlay_for("配置目录不可用，切换只对本次运行有效", OVERLAY_TTL);
+            return;
+        };
+        match crate::config::save_atomic(&self.config, &path) {
+            Ok(()) => diag::info(note),
+            Err(err) => {
+                diag::error(&format!("写配置失败: {err:#}"));
+                self.set_overlay_for(format!("切换没有写进配置：{err}"), OVERLAY_TTL);
+            }
+        }
     }
 
     fn clear_screen(&mut self) {
@@ -1683,6 +2050,11 @@ impl App {
     }
 
     fn handle_keydown(&mut self, vk: u32, mods: Modifiers, scan: u16) {
+        // 切换终端弹窗在最上层：它先吃掉按键，绝不漏给终端或设置面板。
+        if self.shell_picker.is_some() {
+            self.handle_shell_picker_key(vk);
+            return;
+        }
         // 面板开着就先给面板；它吃掉所有按键。
         if self.settings_visible() {
             // 面板开着就吃掉所有按键：Esc 关、Enter 存、↑↓ 选、←→ 调。
@@ -2137,11 +2509,7 @@ impl App {
     fn render(&mut self) {
         // 面板/标签数据必须在借出 painter/surface 之前取好：它们都是 `self` 的字段，
         // 一起可变借用以后就不能再回头读 `self.settings`。
-        let panel_view = self
-            .settings
-            .as_ref()
-            .filter(|panel| !panel.is_empty())
-            .map(|panel| (panel.rows(), panel.selected, panel.dirty));
+        let panel_view = self.modal_panel();
         // 标题取一份副本：绘制期间还要可变借用 `self.tabs`（借的是同一块内存，
         // 留着 `&str` 会被借用检查器当成冲突）。
         let tab_titles: Vec<(String, bool)> = {
@@ -2206,21 +2574,16 @@ impl App {
             };
             painter.bg_alpha = bg_alpha;
             painter.text_alpha = text_alpha;
-            if let Some((rows, selected, dirty)) = panel_view {
-                let footer = if dirty {
-                    "未保存 · ↑↓ 选择 ←→ 调整 Enter 保存 Esc 取消"
-                } else {
-                    "↑↓ 选择 ←→ 调整 Enter 保存 Esc 取消"
-                };
+            if let Some(view) = panel_view {
                 painter.draw_panel(
                     &mut frame,
                     &layout,
                     &crate::render::painter::Panel {
-                        title: "设置",
-                        rows,
-                        selected,
-                        footer,
-                        dirty,
+                        title: view.title,
+                        rows: view.rows,
+                        selected: view.selected,
+                        footer: view.footer,
+                        dirty: view.dirty,
                     },
                 );
             } else {
@@ -2455,6 +2818,14 @@ impl App {
             }
             WM_ERASEBKGND => Some(window::ERASE_HANDLED),
             WM_NCHITTEST => Some(self.hit_test(hwnd, lparam)),
+            WM_SETCURSOR => {
+                // 整个窗口的光标都由自己分派：类光标只有一个（以前是 I-beam），
+                // 一旦让默认过程参与，边框与按钮就会各自退回那个错误的光标。
+                // lparam 里的命中码不用——`refresh_cursor` 自己按指针位置重算，
+                // 这样「鼠标没动、只是弹窗开合」的时机也能拿到正确结果。
+                self.refresh_cursor(hwnd);
+                Some(LRESULT(1))
+            }
             WM_MOUSEACTIVATE => {
                 // 顶层窗口：允许激活，键盘才拿得到（子窗口方案下这句等同于空操作）。
                 diag::debug("收到 WM_MOUSEACTIVATE");
@@ -2531,6 +2902,13 @@ impl App {
                 if self.real_probe {
                     self.real_events.0 += 1;
                 }
+                // 弹窗开着的时候点击只归弹窗：点行 = 选中并把该行的值推到下一个，
+                // 点空白什么也不做。绝不能让点击漏给下面的选字逻辑。
+                if self.shell_picker.is_some() {
+                    let (_, click_y) = client_point(lparam);
+                    self.handle_shell_picker_click(click_y);
+                    return Some(LRESULT(0));
+                }
                 // 标签栏先判：那是导航条，不是网格。落在栏上就不该起选区，
                 // 否则点标签会顺手把第一行文字选中。
                 let (click_x, click_y) = client_point(lparam);
@@ -2548,7 +2926,7 @@ impl App {
                             self.close_tab(index, hwnd);
                         }
                         crate::render::layout::TabHit::New => self.open_tab(hwnd),
-                        crate::render::layout::TabHit::Shell => self.cycle_shell(hwnd),
+                        crate::render::layout::TabHit::Shell => self.open_shell_picker(),
                         crate::render::layout::TabHit::Clear => self.clear_screen(),
                         crate::render::layout::TabHit::Blank => {}
                     }
@@ -2581,6 +2959,9 @@ impl App {
             WM_MOUSEMOVE => {
                 self.drag_selection(lparam);
                 self.track_hover(lparam);
+                // 光标跟着指针走：光靠 WM_SETCURSOR 不够，弹窗开合、按钮互切这些
+                // 状态变化发生时指针并没有移动，样式就会停在旧的那一种。
+                self.refresh_cursor(hwnd);
                 None
             }
             WM_MOUSELEAVE => {
@@ -3290,5 +3671,93 @@ mod ime_dedupe_tests {
             ImeSource::Composition,
             Instant::now()
         ));
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    fn picker(choice: usize, new_session: bool, focus: usize) -> ShellPicker {
+        ShellPicker {
+            choices: SHELL_CHOICES.to_vec(),
+            choice,
+            new_session,
+            focus,
+        }
+    }
+
+    #[test]
+    fn picker_rows_are_exactly_two_and_name_both_modes() {
+        let rows = picker(0, false, 0).rows();
+        assert_eq!(rows.len(), 2, "弹窗只有两行：终端、方式");
+        assert_eq!(rows[0].0, "终端");
+        assert_eq!(rows[0].1, SHELL_CHOICES[0].label);
+        assert_eq!(rows[1].0, "方式");
+        assert_eq!(rows[1].1, "原地切换（保留记录）");
+
+        // 同一份数据切成「新开标签」只改第二行的值，行数不变。
+        let rows = picker(0, true, 1).rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].1, "新开标签（另起会话）");
+    }
+
+    #[test]
+    fn picker_adjust_touches_only_the_focused_row() {
+        // 第 0 行：换候选。
+        let mut p = picker(0, false, 0);
+        p.adjust(true);
+        assert_eq!(p.choice, 1 % SHELL_CHOICES.len());
+        assert!(!p.new_session, "换终端不该顺手改方式");
+
+        // 第 1 行：换方式，候选不动。
+        let mut p = picker(1, false, 1);
+        p.adjust(true);
+        assert!(p.new_session);
+        assert_eq!(p.choice, 1, "换方式不该顺手改终端");
+    }
+
+    #[test]
+    fn picker_choice_cycles_in_both_directions() {
+        let mut p = picker(0, false, 0);
+        p.adjust(false);
+        assert_eq!(p.choice, SHELL_CHOICES.len() - 1, "往回是环形的");
+        p.adjust(true);
+        assert_eq!(p.choice, 0);
+    }
+
+    #[test]
+    fn picker_focus_stays_inside_the_two_rows() {
+        let mut p = picker(0, false, 0);
+        p.move_focus(-5);
+        assert_eq!(p.focus, 0);
+        p.move_focus(99);
+        assert_eq!(p.focus, 1);
+    }
+
+    #[test]
+    fn picker_click_selects_the_row_before_adjusting() {
+        let mut p = picker(0, false, 0);
+        p.click_row(1);
+        assert_eq!(p.focus, 1);
+        assert!(p.new_session, "点行=选中并把这一行的值推到下一个");
+
+        let mut p = picker(0, false, 1);
+        p.click_row(0);
+        assert_eq!(p.focus, 0);
+        assert_eq!(p.choice, 1 % SHELL_CHOICES.len());
+    }
+
+    #[test]
+    fn picker_lists_at_least_one_usable_shell_on_this_machine() {
+        // 候选是「真正能起来」的那几个：本机至少该有 cmd.exe。
+        let config = crate::config::ShellConfig::default();
+        let picker = ShellPicker::available(&config, false).expect("至少 cmd.exe 该能解析");
+        assert!(!picker.choices.is_empty());
+        assert!(
+            picker.choices.len() <= SHELL_CHOICES.len(),
+            "候选只能来自固定白名单"
+        );
+        assert!(picker.selected().is_some());
     }
 }

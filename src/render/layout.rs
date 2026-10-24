@@ -50,6 +50,14 @@ pub const TAB_GAP: i32 = 4;
 pub const TAB_PAD_LEFT: i32 = 8;
 /// 叉号占位宽度：标题区必须给它让出这么多，否则最后一个字会和 × 叠在一起。
 pub const TAB_CLOSE_W: i32 = 18;
+/// 「清屏」按钮占几个单元格宽。
+///
+/// 它是两个**汉字**，每个汉字在网格里占两格，所以文字本身就占四格：
+/// 按两格给宽会让文字溢出到窗口右边缘之外，绘制时还会因为按一格步进
+/// 而把「清」「屏」压在同一处（用户看到的字叠字）。
+/// 给五格而不是四格，是为了文字两侧各留半格——四格宽时文字正好顶满按钮，
+/// 右边缘顶到窗口边框上，看上去像被裁掉了。
+pub const CLEAR_W_CELLS: i32 = 5;
 
 /// 标签栏一次算好的全部几何。
 ///
@@ -90,8 +98,8 @@ pub fn tab_bar(cell_w: i32, titles: &[&str], client_w: i32) -> TabBar {
     let client_w = client_w.max(1);
 
     let margin = 10;
-    let clear_w = cell_w * 2;
-    let clear_center = (client_w - margin - cell_w).max(0);
+    let clear_w = cell_w * CLEAR_W_CELLS;
+    let clear_center = (client_w - margin - clear_w / 2).max(0);
     let clear_left = client_w - margin - clear_w;
     let shell_w = cell_w * 4;
     let shell_center = (clear_left - 12 - shell_w / 2).max(0);
@@ -147,7 +155,7 @@ pub fn hit_tab_bar(bar: &TabBar, cell_w: i32, x: i32) -> TabHit {
     if to_shell <= cell_w * 2 && to_shell <= to_clear {
         return TabHit::Shell;
     }
-    if to_clear <= cell_w + 4 {
+    if to_clear <= cell_w * (CLEAR_W_CELLS / 2) + 4 {
         return TabHit::Clear;
     }
     TabHit::Blank
@@ -398,5 +406,24 @@ mod tests {
         let bar = super::tab_bar(8, &["shell"], 900);
         assert!(bar.shell_center > bar.new_center + 8);
         assert!(bar.shell_center < bar.clear_center - 8);
+    }
+
+    #[test]
+    fn clear_button_is_wide_enough_for_two_cjk_glyphs() {
+        // 回归：「清屏」两个字曾被画在同一处（宽字符按一格步进），按钮又只有两格宽，
+        // 文字溢出到窗口右边缘之外。现在按钮给足四格，命中区覆盖整块。
+        let cell_w = 8;
+        let client_w = 900;
+        let bar = super::tab_bar(cell_w, &["shell"], client_w);
+        let half = cell_w * super::CLEAR_W_CELLS / 2;
+        assert!(bar.clear_center + half <= client_w);
+        assert!(bar.clear_center - half > bar.shell_center + cell_w);
+        for dx in [-half + 1, -cell_w, cell_w, half - 1] {
+            assert_eq!(
+                super::hit_tab_bar(&bar, cell_w, bar.clear_center + dx),
+                super::TabHit::Clear,
+                "离清屏中心 {dx} 像素处应当是清屏按钮"
+            );
+        }
     }
 }

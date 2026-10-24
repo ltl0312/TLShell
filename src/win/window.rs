@@ -15,7 +15,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, LoadCursorW,
-    RegisterClassExW, ShowWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_IBEAM,
+    RegisterClassExW, ShowWindow, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW,
     SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
     WS_POPUP,
 };
@@ -46,8 +46,11 @@ pub type WndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESU
 
 /// 注册窗口类。重复注册视为成功（多实例场景）。
 pub fn register_class(hinstance: HINSTANCE, proc: WndProc) -> Result<()> {
-    // SAFETY: 加载系统预定义光标（IDC_IBEAM），不涉及任何调用方指针。
-    let cursor = unsafe { LoadCursorW(None, IDC_IBEAM) }.unwrap_or_default();
+    // 类光标给箭头，而不是 I-beam：真正的样式由 `WM_SETCURSOR` 按「指针下面是
+    // 按钮还是网格」逐个决定（应用层 `refresh_cursor`）。这里只是兜底——万一那条
+    // 消息没到，整块客户区也不该长得像一个可以框选文字的文本框。
+    // SAFETY: 只是加载系统预定义光标资源名，不涉及任何调用方指针。
+    let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,

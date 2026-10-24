@@ -65,8 +65,8 @@ cargo build --release
 | `Ctrl+T` / `Ctrl+W` | 新建 / 关闭当前标签（关掉最后一个会自动补一个新的） |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | 循环切换标签 |
 | `Ctrl+L` | 清屏：给 PowerShell/bash 发 `Ctrl+L`，由 shell 自己清屏并**重画提示符**；`cmd.exe` 不认 `Ctrl+L`，退回本地清网格 |
-| 鼠标移到标签栏按钮上 | 按钮与标签会亮一层（悬停反馈） |
-| 标签栏的 `shell` 按钮 | 点一下按 `pwsh → powershell → cmd` 循环切换当前标签的 shell，并写回配置 |
+| 鼠标移到标签栏按钮上 | 按钮与标签会亮一层（悬停反馈），指针变成手型；网格区域仍是文本插入符 |
+| 标签栏的 `shell` 按钮 | 弹出「切换终端」菜单：↑↓ 选行、←→ 改值、`Enter` 确认、`Esc` 取消，也可以直接点行。第 0 行选终端（只列本机真能起来的那些），第 1 行选方式——「原地切换（保留记录）」换 shell 但保留屏幕与回滚历史，「新开标签（另起会话）」另起一个标签。切换会写回配置 |
 | `Shift+PageUp` / `Shift+PageDown` | 整屏回看历史（裸 `PageUp` 仍交给 shell） |
 | `Shift+Home` / `Shift+End` | 跳到历史最早 / 回到最新 |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 字号加一档 / 减一档 / 复位（步长 1px，范围 6–72，立刻写回配置） |

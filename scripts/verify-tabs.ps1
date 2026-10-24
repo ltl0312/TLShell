@@ -21,7 +21,8 @@ New-Item -ItemType Directory -Force -Path $appData, $localData | Out-Null
 
 $config = Join-Path $root 'config.toml'
 @'
-shell = "pwsh.exe"
+[shell]
+program = "pwsh.exe"
 
 [window]
 width = 900
@@ -118,6 +119,20 @@ function Post-Click {
     }
     Start-Sleep -Milliseconds 220
 }
+
+function Post-Key {
+    param([IntPtr]$Hwnd, [int]$VirtualKey, [int]$ScanCode)
+    # lParam 照真实按键拼：低 16 位重复次数=1，16..23 位扫描码，30 位「前一状态=按下」。
+    # 用整数乘加而不是 -shl/-bor：PowerShell 的位运算会跟着 Int32/Int64 走，
+    # 高位一旦参与就容易被符号扩展改写。
+    $lparam = [int64]1 + [int64]$ScanCode * 65536 + [int64]1073741824
+    [Aegis.Msg]::PostMessageW($Hwnd, 0x0100, [IntPtr]$VirtualKey, [IntPtr]$lparam) | Out-Null
+    Start-Sleep -Milliseconds 220
+}
+
+function Post-Enter { param([IntPtr]$Hwnd) Post-Key $Hwnd 13 0x1C }
+
+function Post-Escape { param([IntPtr]$Hwnd) Post-Key $Hwnd 27 0x01 }
 
 $env:TLSHELL_LOG = 'info'
 $env:TLSHELL_NO_MODAL = '1'
@@ -232,24 +247,64 @@ try {
     $text = Wait-ForLogLine -Pattern '悬停: Clear'
     Check '悬停清屏有反馈' ($text -match '悬停: Clear') '期望日志「悬停: Clear」'
 
-    # 8) shell 类型按钮：点一下必须切换并写回配置
-    $before = Get-Content -Raw -Encoding utf8 $logPath
+    # 8) shell 类型按钮：必须弹窗让用户选，不能点一下就偷偷换掉
     Post-Click $hwnd $shellCenter $y
-    $text = Wait-ForLogLine -Pattern 'shell 已切换为'
-    Check '点 shell 按钮切换类型' ($text -match 'shell 已切换为') '期望日志「shell 已切换为 …」'
+    $text = Wait-ForLogLine -Pattern '打开切换终端弹窗: '
+    $pm = [regex]::Match($text, '打开切换终端弹窗: (\d+) 个候选，当前 (\S+)，行中心=\[(\d+), (\d+)\]，行高=(\d+)')
+    Check '点 shell 按钮弹出选择弹窗' ($pm.Success) '期望日志「打开切换终端弹窗: … 行中心=[…]」'
+    if (-not $pm.Success) { throw '弹窗没有打开，后面几个用例都无从下手' }
+    # 行的竖直中心也从日志里取：脚本不再自己算弹窗几何。
+    $rowX = [int]($clipEnd / 2)
+    $row0 = [int]$pm.Groups[3].Value
+    $row1 = [int]$pm.Groups[4].Value
 
-    # 9) 回滚：先造出比一屏更多的输出，再往上滚一格，必须进入回滚状态
+    # 8a) 鼠标点「方式」行：状态必须在两种方式之间翻面
+    Post-Click $hwnd $rowX $row1
+    $text = Wait-ForLogLine -Pattern '切换终端弹窗: 点第 2 行'
+    Check '弹窗行能被点中' ($text -match '方式=新开标签') '点「方式」行应把方式翻成新开标签'
+    Post-Click $hwnd $rowX $row1
+    # 等待条件必须是「只有第二次点击才会产生」的那串字，否则等第一次的同名日志会立刻返回、读到旧内容。
+    $text = Wait-ForLogLine -Pattern '方式=原地切换'
+    Check '弹窗行可翻回' ($text -match '方式=原地切换') '再点一次应翻回原地切换'
+
+    # 8b) Esc 取消：关掉弹窗，什么都不做
+    Post-Escape $hwnd
+    $text = Wait-ForLogLine -Pattern '关闭切换终端弹窗'
+    Check 'Esc 取消弹窗' ($text -match '关闭切换终端弹窗（未确认）') '期望日志「关闭切换终端弹窗（未确认）」'
+
+    # 8c) 默认回车确认：选的就是当前终端，必须认成「已经是」，不能白重启一次
+    Post-Click $hwnd $shellCenter $y
+    Start-Sleep -Milliseconds 250
+    Post-Enter $hwnd
+    $text = Wait-ForLogLine -Pattern '原地切换: 当前已经是'
+    Check '确认当前终端不重启' ($text -match '未重启') '期望日志「原地切换: 当前已经是 …，未重启」'
+
+    # 9) 先造出比一屏更多的输出并滚进历史：这是下面「切换不清记录」的基线
     Post-Click $hwnd ([int]($clipEnd / 2)) ([int]($barH + 40))
     Post-Text $hwnd '1..80|%{$_}'
     # 回车必须走 WM_KEYDOWN：WM_CHAR 的 0x0D 会被 handle_char 当控制字符丢掉，
     # 真实回车也是先到 WM_KEYDOWN 再由按键编码路径写成 CR 。
-    $scan = [int64]0x1C -shl 16
-    [Aegis.Msg]::PostMessageW($hwnd, 0x0100, [IntPtr]13, [IntPtr]$scan) | Out-Null
+    Post-Enter $hwnd
     Start-Sleep -Milliseconds 2000
     Post-Wheel $hwnd ([int]($clipEnd / 2)) ([int]($barH + 40)) 120
     $text = Wait-ForLogLine -Pattern '回滚: 偏移='
     $rm = [regex]::Match($text, '回滚: 偏移=(\d+) 历史=(\d+)')
     Check '滚轮回滚进历史' ($rm.Success -and [int]$rm.Groups[1].Value -gt 0 -and [int]$rm.Groups[2].Value -gt 0) "期望「回滚: 偏移=>0 历史=>0」，实际：$($rm.Value)"
+    $historyBefore = if ($rm.Success) { [int]$rm.Groups[2].Value } else { 0 }
+
+    # 10) 换成另一类终端并原地确认：不能新开标签，也不能把历史清掉
+    $tabsBefore = @(Read-Slots).Count
+    Post-Click $hwnd $shellCenter $y
+    Start-Sleep -Milliseconds 250
+    Post-Click $hwnd $rowX $row0
+    $text = Wait-ForLogLine -Pattern '切换终端弹窗: 点第 1 行'
+    Check '弹窗终端行可点' ($text -match '终端=') '点「终端」行应换到下一个候选'
+    Post-Enter $hwnd
+    $text = Wait-ForLogLine -Pattern '屏幕与回滚历史保留'
+    $hm = [regex]::Match($text, '原地切换: (\S+)，屏幕与回滚历史保留（历史=(\d+) 行，切换前=(\d+) 行）')
+    Check '原地切换保留历史' ($hm.Success -and [int]$hm.Groups[2].Value -ge $historyBefore -and [int]$hm.Groups[2].Value -gt 0) "切换前历史=$historyBefore，切换后应不小于它且大于 0"
+    $tabsAfter = @(Read-Slots).Count
+    Check '原地切换不开新标签' ($tabsAfter -eq $tabsBefore) "标签数应保持 $tabsBefore，实际 $tabsAfter"
 
     foreach ($r in $results) {
         $tag = if ($r.Ok) { '[PASS]' } else { '[FAIL]' }

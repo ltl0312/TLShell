@@ -785,7 +785,7 @@ impl Painter {
                 40,
             );
         }
-        let shell_text_w = shell_label.chars().count() as i32 * cell_w;
+        let shell_text_w = text_width(shell_label, layout);
         self.draw_bar_text(
             frame,
             layout,
@@ -798,7 +798,9 @@ impl Painter {
             },
         );
 
-        let clear_w = cell_w * 2;
+        // 「清屏」按真实字宽居中：两个汉字 = 四格，按格数估宽会把它们挤成一团。
+        let clear_text = "清屏";
+        let clear_w = cell_w * crate::render::layout::CLEAR_W_CELLS;
         if hover == TabHit::Clear {
             frame.fill_rect_a(
                 bar.clear_center - clear_w / 2,
@@ -813,9 +815,9 @@ impl Painter {
             frame,
             layout,
             BarRun {
-                x: bar.clear_center - cell_w,
+                x: bar.clear_center - text_width(clear_text, layout) / 2,
                 y: y0,
-                text: "清屏",
+                text: clear_text,
                 color: muted,
                 bold: false,
             },
@@ -901,12 +903,23 @@ impl Painter {
         } = run;
         let flags = if bold { Flags::BOLD } else { Flags::empty() };
         let alpha = self.text_alpha;
+        let limit = frame.width as i32;
         let mut cursor = x;
         for ch in text.chars() {
+            // 宽字符（汉字）占两格：按一格步进会把「清」「屏」画在同一处，
+            // 用户看到的就是两个字叠成一团。与 `draw_text` 用同一条推进规则。
+            let advance = if is_wide(ch) {
+                layout.cell_w * 2
+            } else {
+                layout.cell_w
+            };
+            if cursor + advance > limit {
+                break;
+            }
             if ch != ' ' {
                 self.draw_glyph(frame, layout, ch, flags, color, cursor, y, alpha);
             }
-            cursor += layout.cell_w;
+            cursor += advance;
         }
     }
 
