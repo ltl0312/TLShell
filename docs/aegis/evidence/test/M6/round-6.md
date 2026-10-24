@@ -1,4 +1,4 @@
-# 第 6 轮全量测试（2026-10-23 20:52:45 +08:00）
+# 第 6 轮全量测试（2026-10-24 11:47:52 +08:00）
 
 本轮参数：opacity=0.92 padding=18 radius=16
 
@@ -9,7 +9,7 @@
 | A | cargo fmt --check | PASS | 格式一致 |
 | A | cargo clippy -D warnings | PASS | 无告警 |
 | A | cargo build | PASS | debug 可执行文件已重建 |
-| A | cargo test | PASS | 177 passed |
+| A | cargo test | PASS | 185 passed |
 | B | selftest 全部通过 | PASS | 12 项 |
 | B | selftest 退出码 | PASS | exit=0 |
 | C | 窗口创建为顶层 | PASS | window hwnd=0x |
@@ -40,12 +40,12 @@
 | D | --quit 无实例退 0 | PASS | exit=0 |
 | D | --quit 真的退出实例 | PASS | aliveBefore=True closed=True |
 | D | 背景/文字透明度互不影响 | PASS | 通过 3 项，失败 0 项  |
-| D | 标签栏按钮可点 | PASS | 通过 6 项，失败 0 项  |
+| D | 标签栏与回滚可用 | PASS | 通过 9 项，失败 0 项  |
 | D | 自启动状态可读 | PASS | exit=0 out=随 Windows 启动: 已开启（"D:\Code\Rust\TLShell\target\debug\tlshell.exe"） |
 | D | 白/黑壁纸对比度 ≥ 4.5:1 | PASS | 测得 8.15/11.88，最差 8.15 |
 | D | 降权重启在非提权下退 0 | PASS | exit=0 |
 | D | 未知参数被拒绝 | PASS | exit=1 |
-| D | 坏配置仍能启动 | PASS | started=True 末尾日志：[info] 启动完成: rect=900x420@(40,40); client=900x420; dpi=130 / [info] 命中自检: (490, 250) -> 其他窗口:Chrome_RenderWidgetHostHWND pid=35172 句柄=0x60dc2 可见=true 沉底=true / [info] ConPTY 切到 Win32 输入模式（?9001h）；本终端继续发送 VT 序列 /  |
+| D | 坏配置仍能启动 | PASS | started=True 末尾日志：[info] 标签栏: 单元格=11 栏高=30 新建中心=798 shell中心=834 清屏中心=879 标签数=1 可绘右界=786 / [info] 标签[0]: shell 1 起=4 止=113 叉=98 / [info] 命中自检: (490, 250) -> 其他窗口:Chrome_RenderWidgetHostHWND pid=13552 句柄=0x1e110e 可见=true 沉底=true /  |
 | D | 缺 USERPROFILE 拒绝启动 | PASS | exited=True exit=1 |
 | E | 真实点击命中自己 | PASS | 真实点击@.*moved=true down=true up=true |
 | E | 真实点击拿到焦点 | PASS | (点击取焦点: foreground=true\|抬到最前 foreground=true) |

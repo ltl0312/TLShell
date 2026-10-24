@@ -170,6 +170,15 @@ pub struct Panel<'a> {
 }
 
 /// 标签栏的一个标签：只带标题和是否当前，不带会话。
+/// 标签栏的即时状态：鼠标停在哪、当前 shell 类型怎么写。
+///
+/// 打包成一个结构是因为 `draw_tab_bar` 的参数已经到 7 个，
+/// 再拆开两个裸参数就过不了 clippy 的 `too_many_arguments`。
+pub struct TabBarState<'a> {
+    pub hover: crate::render::layout::TabHit,
+    pub shell_label: &'a str,
+}
+
 pub struct TabView<'a> {
     pub title: &'a str,
     pub active: bool,
@@ -615,8 +624,9 @@ impl Painter {
 
     /// 画顶部标签栏（浏览器式导航条）。
     ///
-    /// 几何全部来自 [`crate::render::layout::tab_slots`]，painter 只按算好的 x 落笔——
-    /// 点击判定用的是同一组函数，所以「看起来在哪」和「点得到哪」不可能漂移。
+    /// 几何全部来自 [`crate::render::layout::tab_bar`]：painter 只按算好的 x 落笔，
+    /// 点击判定用的是同一份 `TabBar`，所以「看起来在哪」和「点得到哪」不可能漂移。
+    /// `hover` 让鼠标悬停的格子亮一下——没有反馈的按钮等于没有按钮。
     pub fn draw_tab_bar(
         &mut self,
         frame: &mut Frame<'_>,
@@ -624,7 +634,12 @@ impl Painter {
         bar_h: i32,
         tabs: &[TabView<'_>],
         focused: bool,
+        state: TabBarState<'_>,
     ) {
+        let hover = state.hover;
+        let shell_label = state.shell_label;
+        use crate::render::layout::{TabHit, TAB_CLOSE_W, TAB_PAD_LEFT};
+
         let bar_alpha = self.painted_bg_alpha().max(160);
         frame.fill_rect_a(
             0,
@@ -645,16 +660,28 @@ impl Painter {
         );
 
         let titles: Vec<&str> = tabs.iter().map(|view| view.title).collect();
-        let slots = crate::render::layout::tab_slots(layout.cell_w, &titles);
+        let bar = crate::render::layout::tab_bar(layout.cell_w, &titles, frame.width as i32);
         let y0 = ((bar_h - layout.cell_h) / 2).max(0);
         let muted = blend(self.theme.background, self.theme.foreground, 150);
+        let cell_w = layout.cell_w.max(1);
 
-        for (view, slot) in tabs.iter().zip(slots.iter()) {
+        for (index, (view, slot)) in tabs.iter().zip(bar.slots.iter()).enumerate() {
             let color = if view.active {
                 self.theme.foreground
             } else {
                 muted
             };
+            let hovered = matches!(hover, TabHit::Select(i) | TabHit::Close(i) if i == index);
+            if hovered {
+                frame.fill_rect_a(
+                    slot.start,
+                    1,
+                    slot.end - slot.start,
+                    bar_h - 2,
+                    self.theme.foreground,
+                    30,
+                );
+            }
             if view.active {
                 // 当前标签：整块提到正文背景色，下沿一条强调线。
                 frame.fill_rect_a(
@@ -674,24 +701,47 @@ impl Painter {
                     255,
                 );
             }
+            // 标题按可用宽度截断：叉号占位是硬约束，宁可出省略号也不能压到 × 上。
+            let text_room = (slot.end - slot.start) - TAB_PAD_LEFT - TAB_CLOSE_W - 6;
+            let max_chars = (text_room / cell_w).max(1) as usize;
+            let title = if view.title.chars().count() > max_chars {
+                let mut short: String = view
+                    .title
+                    .chars()
+                    .take(max_chars.saturating_sub(1))
+                    .collect();
+                short.push('…');
+                short
+            } else {
+                view.title.to_owned()
+            };
             self.draw_bar_text(
                 frame,
                 layout,
                 BarRun {
-                    x: slot.start + 8,
+                    x: slot.start + TAB_PAD_LEFT,
                     y: y0,
-                    text: view.title,
+                    text: &title,
                     color,
                     bold: view.active,
                 },
             );
             // 叉号用「×」字形：比画两条斜线稳定，且免费获得抗锯齿。
-            let close_x = slot.close_center - layout.cell_w / 2;
+            if hover == TabHit::Close(index) {
+                frame.fill_rect_a(
+                    slot.close_center - cell_w / 2 - 2,
+                    2,
+                    cell_w + 4,
+                    bar_h - 4,
+                    self.theme.foreground,
+                    40,
+                );
+            }
             self.draw_bar_text(
                 frame,
                 layout,
                 BarRun {
-                    x: close_x,
+                    x: slot.close_center - cell_w / 2,
                     y: y0,
                     text: "×",
                     color,
@@ -700,12 +750,23 @@ impl Painter {
             );
         }
 
-        let plus = crate::render::layout::new_button_center(layout.cell_w, &titles);
+        // 按钮：+ / shell 类型 / 清屏。悬停时整块亮一下。
+        let plus_w = cell_w + 8;
+        if hover == TabHit::New {
+            frame.fill_rect_a(
+                bar.new_center - plus_w / 2,
+                2,
+                plus_w,
+                bar_h - 4,
+                self.theme.foreground,
+                40,
+            );
+        }
         self.draw_bar_text(
             frame,
             layout,
             BarRun {
-                x: plus - layout.cell_w / 2,
+                x: bar.new_center - cell_w / 2,
                 y: y0,
                 text: "+",
                 color: self.theme.foreground,
@@ -713,12 +774,46 @@ impl Painter {
             },
         );
 
-        let clear = crate::render::layout::clear_button_center(layout.cell_w, &titles);
+        let shell_w = cell_w * 4;
+        if hover == TabHit::Shell {
+            frame.fill_rect_a(
+                bar.shell_center - shell_w / 2,
+                2,
+                shell_w,
+                bar_h - 4,
+                self.theme.foreground,
+                40,
+            );
+        }
+        let shell_text_w = shell_label.chars().count() as i32 * cell_w;
         self.draw_bar_text(
             frame,
             layout,
             BarRun {
-                x: clear - layout.cell_w,
+                x: bar.shell_center - shell_text_w / 2,
+                y: y0,
+                text: shell_label,
+                color: muted,
+                bold: false,
+            },
+        );
+
+        let clear_w = cell_w * 2;
+        if hover == TabHit::Clear {
+            frame.fill_rect_a(
+                bar.clear_center - clear_w / 2,
+                2,
+                clear_w,
+                bar_h - 4,
+                self.theme.foreground,
+                40,
+            );
+        }
+        self.draw_bar_text(
+            frame,
+            layout,
+            BarRun {
+                x: bar.clear_center - cell_w,
                 y: y0,
                 text: "清屏",
                 color: muted,
@@ -728,6 +823,30 @@ impl Painter {
 
         // 标签栏盖住了窗口上沿，边框要重描一次，否则圆角在顶部像是缺了一块。
         self.draw_border(frame, focused);
+    }
+
+    /// 画右侧回滚指示条：正在看历史时才出现。
+    ///
+    /// 为什么需要它：滚回历史之后终端内容不再跟随输出，屏幕上没有任何线索说明
+    /// 「你正在看过去」，用户会以为程序卡住了。一条竖条 + 底部提示行把这件事说清楚。
+    pub fn draw_scrollback(
+        &mut self,
+        frame: &mut Frame<'_>,
+        layout: &Layout,
+        offset: usize,
+        history: usize,
+    ) {
+        if offset == 0 || history == 0 {
+            return;
+        }
+        let track_top = layout.top_inset + layout.padding;
+        let track_h = (frame.height as i32 - track_top - layout.padding).max(1);
+        let ratio = (offset.min(history) as f32 / history as f32).clamp(0.0, 1.0);
+        let thumb_h = ((track_h as f32) * 0.15).max(18.0) as i32;
+        let thumb_h = thumb_h.min(track_h);
+        let y = track_top + (((track_h - thumb_h) as f32) * ratio) as i32;
+        let x = (frame.width as i32 - layout.padding - 3).max(0);
+        frame.fill_rect_a(x, y, 3, thumb_h, self.theme.focus_ring, 200);
     }
 
     /// 没有终端可用时（shell 退出后）画一屏：铺底 + 一行提示 + 边框。

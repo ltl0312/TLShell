@@ -223,6 +223,9 @@ paste_guard = {paste_guard}
 pub const OPACITY_WARN_BELOW: f64 = 0.70;
 /// 透明度硬下界。计划书 §9 M4-② 要求 0.5 仍能明显变透，因此下界不能抬到 0.75。
 /// 背景透明度的下限：0 表示「背景完全不可见」。
+/// 字号的可调范围，`sanitize()` 与「Ctrl+= / Ctrl+-」共用同一组边界。
+pub const FONT_SIZE_MIN: f64 = 6.0;
+pub const FONT_SIZE_MAX: f64 = 72.0;
 pub const OPACITY_MIN: f64 = 0.00;
 
 /// 文字透明度的下限：再低就看不见字了。
@@ -401,7 +404,7 @@ impl Config {
         if !self.font.size.is_finite() {
             self.font.size = FontConfig::default().size;
         }
-        self.font.size = self.font.size.clamp(6.0, 72.0);
+        self.font.size = self.font.size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
 
         if !self.font.line_height.is_finite() {
             self.font.line_height = FontConfig::default().line_height;

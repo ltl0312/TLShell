@@ -21,7 +21,8 @@ use windows::Win32::UI::Input::Ime::{
     GCS_RESULTSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, GetWindowLongPtrW, IsWindow, KillTimer, PostQuitMessage,
@@ -35,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
 };
 
-use crate::config::Config;
+use crate::config::{Config, FONT_SIZE_MAX, FONT_SIZE_MIN};
 use crate::diag;
 use crate::render::settings::Settings;
 use crate::render::{Blink, FontSet, Layout, Painter, Theme};
@@ -53,6 +54,10 @@ pub mod selftest;
 
 /// 退出热键的注册 id。
 pub const HOTKEY_ID_QUIT: i32 = 1;
+/// `WM_MOUSELEAVE`（0x02A3）：鼠标离开窗口。
+///
+/// `windows` crate 把它放在要额外 feature 的 `UI::Controls` 里，这里直接写常量值。
+const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 隐藏/清屏热键的注册 id。
 pub const HOTKEY_ID_HIDE: i32 = 2;
 /// 「提到最前 + 拿焦点」热键的注册 id。
@@ -134,6 +139,11 @@ struct Tab {
     terminal: Option<Terminal>,
     events: Option<Receiver<Event>>,
     session: Option<Session>,
+    /// 当前标签实际跑起来的 shell 类型（解析失败时是 `None`）。
+    ///
+    /// 清屏要按类型分派：PowerShell / bash 的 `Ctrl+L` 由 readline 自己清屏并重画提示符，
+    /// 而 `cmd.exe` 不认 `Ctrl+L`，只能由我们清网格。
+    shell_kind: Option<shell::ShellKind>,
 }
 
 impl Tab {
@@ -142,6 +152,7 @@ impl Tab {
             title: title.to_owned(),
             terminal: None,
             events: None,
+            shell_kind: None,
             session: None,
         }
     }
@@ -231,6 +242,10 @@ pub struct App {
     quit_due: Option<Instant>,
     /// `--open-settings`：启动即展开设置面板（视觉取证用）。
     open_panel_at_startup: bool,
+    /// 标签栏上鼠标悬停的格子。`Blank` 表示没停在任何可点处。
+    hover: crate::render::layout::TabHit,
+    /// 是否已经向系统登记过「鼠标离开这个窗口要通知我」。
+    hover_tracking: bool,
 }
 
 /// 真机输入自检的状态机。
@@ -316,6 +331,8 @@ impl App {
             probe_writes: 0,
             quit_due: None,
             open_panel_at_startup: false,
+            hover: crate::render::layout::TabHit::Blank,
+            hover_tracking: false,
         };
         // 光标闪烁同样只在真正有焦点时开（B7 的另一半）。
         app.blink.set_enabled(false);
@@ -387,6 +404,7 @@ impl App {
             self.focused = report.focus_set;
             self.blink.set_enabled(report.focus_set);
         }
+        self.log_tab_geometry();
         self.dirty = true;
     }
 
@@ -421,6 +439,7 @@ impl App {
                 diag::warn(&format!("标签关闭后启动 shell 失败: {err:#}"));
             }
         }
+        self.log_tab_geometry();
         self.dirty = true;
     }
 
@@ -440,20 +459,227 @@ impl App {
                 diag::warn(&format!("切换标签后启动 shell 失败: {err:#}"));
             }
         }
+        self.log_tab_geometry();
         self.dirty = true;
     }
 
-    /// 清屏：只清看得见的屏幕与滚动缓冲，不动 shell 里正在跑的东西。
+    /// 字号加一档/减一档：立刻重排网格并写回配置。
     ///
-    /// 走 VT 序列而不是直接重置网格，是为了让「清屏」与 shell 自己发 `clear`
-    /// 得到完全一样的结果（`CSI 3J` 清回滚、`CSI 2J` 清屏、`CSI H` 光标回原点）。
+    /// 步长 1px 而不是按比例缩放：`font.size` 本身就是像素值，整数步长让
+    /// 「按 5 下变成多少」是可预测的，也不会因为浮点累积漂到 13.999 这种值。
+    fn zoom_font(&mut self, step: i32, hwnd: HWND) {
+        let size = next_font_size(self.config.font.size, step);
+        if (size - self.config.font.size).abs() < f64::EPSILON {
+            self.set_overlay_for("字号已经到头了", OVERLAY_TTL);
+            return;
+        }
+        self.config.font.size = size;
+        self.apply_font_change(hwnd, format!("字号 {size:.0}px"));
+    }
+
+    /// 把字号复位到出厂值。
+    fn reset_font_size(&mut self, hwnd: HWND) {
+        let default = crate::config::FontConfig::default().size;
+        if (default - self.config.font.size).abs() < f64::EPSILON {
+            self.set_overlay_for("字号已经是默认值", OVERLAY_TTL);
+            return;
+        }
+        self.config.font.size = default;
+        self.apply_font_change(hwnd, format!("字号复位为 {default:.0}px"));
+    }
+
+    /// 字号变了的共同收尾：重新加载字体、重排网格、写回配置。
+    fn apply_font_change(&mut self, hwnd: HWND, message: String) {
+        if let Err(err) = self.reload_fonts(hwnd) {
+            diag::error(&format!("换字号时重新加载字体失败: {err:#}"));
+            self.set_overlay_for(format!("换字号失败：{err}"), ADMIN_NOTICE_TTL);
+            return;
+        }
+        if let Err(err) = self.apply_size(hwnd) {
+            diag::warn(&format!("换字号后重排失败: {err:#}"));
+        }
+        if let Some(path) = self.config_path.clone() {
+            if let Err(err) = crate::config::save_atomic(&self.config, &path) {
+                diag::warn(&format!("字号没有写回配置: {err:#}"));
+                self.set_overlay_for(format!("字号已生效，但没写回配置：{err}"), ADMIN_NOTICE_TTL);
+                self.dirty = true;
+                return;
+            }
+        }
+        diag::info(&message);
+        self.set_overlay_for(message, OVERLAY_TTL);
+        self.dirty = true;
+    }
+
+    /// 清屏：把屏幕和滚动缓冲都清掉，但**保留 shell 的提示符**。
+    ///
+    /// 用户实测缺陷：原来无条件发 `CSI 3J CSI 2J CSI H`，网格清空后 shell 并不知道
+    /// 自己该重画提示符，于是连 `PS C:\\Users\\ZhuanZ>` 一起消失，屏幕全黑像卡死。
+    ///
+    /// 正确做法是把清屏交给 readline：PowerShell（PSReadLine）与 bash 收到 `Ctrl+L`
+    /// 会自己清屏并重画提示符，这才是用户在别的终端里看到的「cls 之后提示符还在」。
+    /// `cmd.exe` 不认 `Ctrl+L`，只能由我们清网格（它自己发 `cls` 时同样会重画提示符，
+    /// 所以这里清完网格等它的下一条输出即可）。
+    /// 当前标签的 shell 类型缩写，画在标签栏按钮上。
+    fn shell_label(&self) -> &'static str {
+        match self
+            .tabs
+            .get(self.active_index())
+            .and_then(|tab| tab.shell_kind)
+        {
+            Some(shell::ShellKind::PowerShell7) => "pwsh",
+            Some(shell::ShellKind::PowerShell5) => "ps5",
+            Some(shell::ShellKind::Cmd) => "cmd",
+            Some(shell::ShellKind::Other) => "shell",
+            None => "—",
+        }
+    }
+
+    /// 用当前标签标题与客户区宽度算出整条标签栏的几何。
+    fn tab_bar_now(&self) -> crate::render::layout::TabBar {
+        let titles = self.tab_titles();
+        let client_w = crate::win::window::client_rect(self.hwnd).map_or(0, |rect| rect.w);
+        crate::render::layout::tab_bar(self.layout.cell_w, &titles, client_w)
+    }
+
+    /// 把标签栏几何写进日志。
+    ///
+    /// 验收脚本靠这几行拿坐标，不在脚本里重算宽度——两份几何必然漂移，
+    /// 而「点不准」的 bug 就藏在第二份里。
+    fn log_tab_geometry(&self) {
+        let bar = self.tab_bar_now();
+        diag::info(&format!(
+            "标签栏: 单元格={} 栏高={} 新建中心={} shell中心={} 清屏中心={} 标签数={} 可绘右界={}",
+            self.layout.cell_w,
+            crate::render::layout::tab_bar_height(self.layout.cell_h),
+            bar.new_center,
+            bar.shell_center,
+            bar.clear_center,
+            bar.slots.len(),
+            bar.clip_end
+        ));
+        let titles = self.tab_titles();
+        for (index, slot) in bar.slots.iter().enumerate() {
+            let title = titles.get(index).copied().unwrap_or("?");
+            diag::info(&format!(
+                "标签[{index}]: {title} 起={} 止={} 叉={}",
+                slot.start, slot.end, slot.close_center
+            ));
+        }
+    }
+
+    /// 鼠标在标签栏上移动时更新悬停格，并登记「离开时通知我」。
+    fn track_hover(&mut self, lparam: LPARAM) {
+        let (x, y) = client_point(lparam);
+        let bar_h = crate::render::layout::tab_bar_height(self.layout.cell_h);
+        let hit = if y >= 0 && y < bar_h {
+            let bar = self.tab_bar_now();
+            crate::render::layout::hit_tab_bar(&bar, self.layout.cell_w, x)
+        } else {
+            crate::render::layout::TabHit::Blank
+        };
+        if hit != self.hover {
+            self.hover = hit;
+            self.dirty = true;
+            // 用 info 而不是 debug：验收脚本按 info 级别跑，悬停反馈必须有据可查。
+            diag::info(&format!("悬停: {hit:?}"));
+        }
+        if !self.hover_tracking {
+            // SAFETY: 只填一个全零的 TRACKMOUSEEVENT 结构体，交给系统登记通知。
+            unsafe {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+            }
+            self.hover_tracking = true;
+        }
+    }
+
+    /// 循环切换当前标签的 shell 类型：pwsh → powershell → cmd → pwsh。
+    ///
+    /// 只写 `shell.program` 这一项，其余配置原样保存；切换后立刻重建这个标签的会话，
+    /// 因为 shell 是进程，改配置不可能影响已经在跑的那个。
+    fn cycle_shell(&mut self, hwnd: HWND) {
+        const CANDIDATES: [&str; 3] = ["pwsh.exe", "powershell.exe", "cmd.exe"];
+        let current = self.config.shell.program.to_ascii_lowercase();
+        fn file_name_lower(name: &str) -> String {
+            name.rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase()
+        }
+        let position = CANDIDATES
+            .iter()
+            .position(|candidate| file_name_lower(&current) == candidate.to_ascii_lowercase())
+            .unwrap_or(0);
+        let allow_custom = self.config.security.allow_custom_shell;
+        let mut chosen = None;
+        for step in 1..=CANDIDATES.len() {
+            let candidate = CANDIDATES[(position + step) % CANDIDATES.len()];
+            let mut probe = self.config.clone();
+            probe.shell.program = candidate.to_owned();
+            if shell::resolve(&probe.shell, allow_custom).is_ok() {
+                chosen = Some(candidate.to_owned());
+                break;
+            }
+        }
+        let Some(program) = chosen else {
+            diag::warn("切换 shell 失败：三个候选都不可用");
+            self.set_overlay_for("没有可切换的 shell", OVERLAY_TTL);
+            return;
+        };
+        self.config.shell.program = program.clone();
+        if let Some(path) = self.config_path.clone() {
+            match crate::config::save_atomic(&self.config, &path) {
+                Ok(()) => diag::info(&format!("shell 已切换为 {program}，配置已保存")),
+                Err(err) => diag::warn(&format!("shell 切换后写配置失败: {err:#}")),
+            }
+        }
+        self.force_restart_session(hwnd);
+        self.set_overlay_for(format!("shell 已切换为 {program}"), OVERLAY_TTL);
+    }
+
+    /// 不管当前会话死活都重建一次：先把它挪到后台线程回收，再起新的。
+    fn force_restart_session(&mut self, hwnd: HWND) {
+        let index = self.active_index();
+        if let Some(tab) = self.tabs.get_mut(index) {
+            if let Some(session) = tab.session.take() {
+                // 会话回收可能要等 ConPTY 读线程退出，不能卡在 UI 线程上。
+                std::thread::spawn(move || drop(session));
+            }
+            tab.terminal = None;
+            tab.events = None;
+            tab.shell_kind = None;
+        }
+        self.clear_status();
+        // 失败已经由 spawn_session 自己写进状态行/日志，这里不需要再判一次。
+        let _ = self.spawn_session(hwnd);
+        let _ = self.apply_size(hwnd);
+        self.dirty = true;
+    }
+
     fn clear_screen(&mut self) {
-        if let Some(term) = self.tab_terminal_mut() {
-            term.feed(b"\x1b[3J\x1b[2J\x1b[H");
-            term.scroll_to_bottom();
+        let kind = self
+            .tabs
+            .get(self.active_index())
+            .and_then(|tab| tab.shell_kind);
+        let readline_clears = !matches!(kind, Some(shell::ShellKind::Cmd));
+        if readline_clears {
+            // Ctrl+L：由 shell 自己清屏并重画提示符。
+            self.write_to_pty(&[0x0c]);
+            diag::info("清屏: 已向 shell 发送 Ctrl+L（由 shell 重画提示符）");
+        } else {
+            if let Some(term) = self.tab_terminal_mut() {
+                term.feed(b"\x1b[3J\x1b[2J\x1b[H");
+                term.scroll_to_bottom();
+            }
+            diag::info("清屏: cmd 不认 Ctrl+L，改为本地清网格");
         }
         self.dirty = true;
-        diag::info("清屏");
     }
 
     #[allow(dead_code)] // M5 单实例与重挂使用
@@ -813,6 +1039,8 @@ impl App {
             );
         }
 
+        // `resolved` 会整个搬进 `SpawnOptions`，先把它属于哪种 shell 记下来。
+        let shell_kind = resolved.kind;
         let options = SpawnOptions {
             shell: resolved,
             cols: self.layout.cols as u16,
@@ -830,6 +1058,7 @@ impl App {
                 diag::info(&format!("shell pid={}", session.pid()));
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     tab.session = Some(session);
+                    tab.shell_kind = Some(shell_kind);
                 }
             }
             Err(err) => {
@@ -1085,8 +1314,14 @@ impl App {
         if lines == 0 {
             return;
         }
+        let mut state = None;
         if let Some(term) = self.tab_terminal_mut() {
             term.scroll(lines);
+            state = Some((term.display_offset(), term.history_size()));
+        }
+        if let Some((offset, history)) = state {
+            // 回滚是「界面不再跟随输出」的状态，必须有据可查（也方便验收脚本断言）。
+            diag::info(&format!("回滚: 偏移={offset} 历史={history}"));
         }
         self.dirty = true;
     }
@@ -1544,6 +1779,37 @@ impl App {
             self.paste_from_clipboard();
             return;
         }
+        // 回滚快捷键：Shift+PageUp/PageDown 翻页、Shift+Home/End 到顶/到底。
+        // 必须带 Shift——裸 PageUp 是 shell 的按键（less/more 要用）。
+        if mods.shift && !mods.ctrl && !mods.alt {
+            let page = (self.layout.rows.saturating_sub(1)).max(1) as i32;
+            match key {
+                Key::PageUp => {
+                    self.scroll_view(page);
+                    return;
+                }
+                Key::PageDown => {
+                    self.scroll_view(-page);
+                    return;
+                }
+                Key::Home => {
+                    if let Some(term) = self.tab_terminal_mut() {
+                        term.scroll_to_top();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                Key::End => {
+                    if let Some(term) = self.tab_terminal_mut() {
+                        term.scroll_to_bottom();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // 标签与清屏：都放在编码之前拦下，别把 Ctrl+T 变成 `0x14` 写进 shell。
         if mods.ctrl && !mods.alt {
             match key {
@@ -1560,6 +1826,22 @@ impl App {
                 }
                 Key::Char('l') | Key::Char('L') => {
                     self.clear_screen();
+                    return;
+                }
+                // 字号缩放：终端里最常用的一个调节，不该逼用户去改配置文件。
+                Key::Char('=') => {
+                    let hwnd = self.hwnd;
+                    self.zoom_font(1, hwnd);
+                    return;
+                }
+                Key::Char('-') => {
+                    let hwnd = self.hwnd;
+                    self.zoom_font(-1, hwnd);
+                    return;
+                }
+                Key::Char('0') => {
+                    let hwnd = self.hwnd;
+                    self.reset_font_size(hwnd);
                     return;
                 }
                 Key::Tab => {
@@ -1892,6 +2174,11 @@ impl App {
         let text_alpha = (self.config.window.text_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         let layout = self.layout;
         let hwnd = self.hwnd;
+        let hover = self.hover;
+        let shell_label = self.shell_label();
+        let scrollback = self
+            .tab_terminal()
+            .map(|term| (term.display_offset(), term.history_size()));
 
         // 逐个字段借，别借整个 `self`：`tab_views` 里还拿着 `self.tabs` 的引用。
         let App {
@@ -1939,7 +2226,10 @@ impl App {
             } else {
                 match term {
                     Some(term) => {
-                        painter.draw(&mut frame, &layout, term, flags, overlay_text.as_deref())
+                        painter.draw(&mut frame, &layout, term, flags, overlay_text.as_deref());
+                        if let Some((offset, history)) = scrollback {
+                            painter.draw_scrollback(&mut frame, &layout, offset, history);
+                        }
                     }
                     // shell 退出后没有网格：仍然画一屏，别留一块没刷过的透明面。
                     None => painter.draw_idle(&mut frame, &layout, flags, overlay_text.as_deref()),
@@ -1951,7 +2241,14 @@ impl App {
                         active: *active,
                     })
                     .collect();
-                painter.draw_tab_bar(&mut frame, &layout, bar_h, &tab_views, flags.focused);
+                painter.draw_tab_bar(
+                    &mut frame,
+                    &layout,
+                    bar_h,
+                    &tab_views,
+                    flags.focused,
+                    crate::render::painter::TabBarState { hover, shell_label },
+                );
             }
         }
         if let Err(err) = surface.present(hwnd, radius) {
@@ -2240,8 +2537,8 @@ impl App {
                 let bar_h = crate::render::layout::tab_bar_height(self.layout.cell_h);
                 if click_y >= 0 && click_y < bar_h {
                     let hit = {
-                        let titles = self.tab_titles();
-                        crate::render::layout::hit_tab_bar(self.layout.cell_w, &titles, click_x)
+                        let bar = self.tab_bar_now();
+                        crate::render::layout::hit_tab_bar(&bar, self.layout.cell_w, click_x)
                     };
                     match hit {
                         crate::render::layout::TabHit::Select(index) => {
@@ -2251,6 +2548,7 @@ impl App {
                             self.close_tab(index, hwnd);
                         }
                         crate::render::layout::TabHit::New => self.open_tab(hwnd),
+                        crate::render::layout::TabHit::Shell => self.cycle_shell(hwnd),
                         crate::render::layout::TabHit::Clear => self.clear_screen(),
                         crate::render::layout::TabHit::Blank => {}
                     }
@@ -2282,6 +2580,16 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 self.drag_selection(lparam);
+                self.track_hover(lparam);
+                None
+            }
+            WM_MOUSELEAVE => {
+                // 鼠标离开窗口：把悬停高亮撤掉，否则按钮会一直亮着。
+                self.hover_tracking = false;
+                if self.hover != crate::render::layout::TabHit::Blank {
+                    self.hover = crate::render::layout::TabHit::Blank;
+                    self.dirty = true;
+                }
                 None
             }
             WM_LBUTTONUP => {
@@ -2548,6 +2856,13 @@ fn describe_exit_code(code: u32) -> String {
     format!("退出码 {code}")
 }
 
+/// 字号加减一档，并夹在允许范围内。
+///
+/// 抽成自由函数是为了能单测：`zoom_font` 要 HWND 才能重排，测不到边界。
+fn next_font_size(current: f64, step: i32) -> f64 {
+    (current + f64::from(step)).clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
+}
+
 fn char_is_repeat(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now < deadline)
 }
@@ -2738,6 +3053,7 @@ pub fn run(options: RunOptions) -> Result<i32> {
     }
 
     diag::info(&format!("启动完成: {}", window::describe(hwnd)));
+    app.log_tab_geometry();
     // 遮挡自检：外部探针（受限桌面）看不到真实窗口，因此「点得到吗」只能由本进程回答。
     diag::info(&format!(
         "命中自检: {} 可见={} 沉底={}",
@@ -2866,10 +3182,39 @@ mod tests {
 }
 
 #[cfg(test)]
+mod font_zoom_tests {
+    use super::{next_font_size, FONT_SIZE_MAX, FONT_SIZE_MIN};
+
+    #[test]
+    fn one_step_moves_exactly_one_pixel() {
+        assert_eq!(next_font_size(14.0, 1), 15.0);
+        assert_eq!(next_font_size(14.0, -1), 13.0);
+    }
+
+    #[test]
+    fn zoom_stops_at_the_configured_bounds() {
+        assert_eq!(next_font_size(FONT_SIZE_MIN, -1), FONT_SIZE_MIN);
+        assert_eq!(next_font_size(FONT_SIZE_MAX, 1), FONT_SIZE_MAX);
+    }
+
+    #[test]
+    fn bounds_match_the_sanitizer() {
+        // sanitize() 与缩放共用同一组常量，越界值必须被同一处夹住。
+        let mut config = crate::config::Config::default();
+        config.font.size = 999.0;
+        config.sanitize();
+        assert_eq!(config.font.size, FONT_SIZE_MAX);
+        config.font.size = 1.0;
+        config.sanitize();
+        assert_eq!(config.font.size, FONT_SIZE_MIN);
+    }
+}
+
 mod ime_dedupe_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
+    #[allow(dead_code)]
     fn last(text: &str, source: ImeSource, at: Instant) -> (String, Instant, ImeSource) {
         (text.to_owned(), at, source)
     }

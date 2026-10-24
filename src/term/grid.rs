@@ -7,9 +7,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
@@ -62,6 +61,13 @@ pub struct Terminal {
     term: Term<EventProxy>,
     processor: Processor,
     size: TermSize,
+    /// 选区的两个角，都是**网格坐标**（行号不含回滚偏移）。
+    ///
+    /// 不用上游 `Selection`：它的 `range_simple` 在「起点落在格子右半边」时会把
+    /// 首字符砍掉，反向拖选（从右往左）必然丢第一个字。自己存两个格子坐标，
+    /// 语义就是「首尾两格都算选中」，与画面上看到的一致。
+    sel_start: Option<Point>,
+    sel_end: Option<Point>,
     /// ConPTY 的 Win32 输入模式（`CSI ? 9001 h`）。
     ///
     /// 上游 `TermMode` 没有这个标志位（开发者工具实测项 ②），只能自己记。
@@ -88,6 +94,8 @@ impl Terminal {
                 term,
                 processor,
                 size,
+                sel_start: None,
+                sel_end: None,
                 win32_input: false,
             },
             rx,
@@ -158,8 +166,56 @@ impl Terminal {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// 滚到历史缓冲的最顶端（最早那一行）。
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+    }
+
+    /// 历史缓冲总行数：滚动条指示器用它算比例。
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// 选中区域的文字：逐行取格，行尾空格去掉，行间用 `\n` 连接。
+    ///
+    /// 宽字符的右半格（`WIDE_CHAR_SPACER`）必须跳过，否则一个汉字会变成两个字符。
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string()
+        let (start, end) = self.selection_range()?;
+        let grid = self.term.grid();
+        let columns = grid.columns();
+        let mut out = String::new();
+        let mut line = start.line;
+        while line <= end.line {
+            let first = if line == start.line {
+                start.column.0
+            } else {
+                0
+            };
+            let last = if line == end.line {
+                end.column.0.min(columns.saturating_sub(1))
+            } else {
+                columns.saturating_sub(1)
+            };
+            let mut text = String::new();
+            if first <= last {
+                for col in first..=last {
+                    let cell = &grid[line][Column(col)];
+                    if cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                    {
+                        continue;
+                    }
+                    text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                }
+            }
+            out.push_str(text.trim_end_matches(' '));
+            if line != end.line {
+                out.push('\n');
+            }
+            line += 1;
+        }
+        Some(out)
     }
 
     /// 视口顶部相对历史缓冲的偏移行数（滚回历史后为正）。
@@ -169,28 +225,33 @@ impl Terminal {
 
     /// 当前选中的文字范围（起点、终点）。没选区或选区为空时返回 `None`。
     pub fn selection_range(&self) -> Option<(Point, Point)> {
-        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
-        if range.start == range.end {
+        let (mut start, mut end) = (self.sel_start?, self.sel_end?);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        if start == end {
             return None;
         }
-        Some((range.start, range.end))
+        Some((start, end))
     }
 
     /// 起一个简单选区。坐标是**网格坐标**（行号已扣掉 `display_offset`）。
     pub fn start_selection(&mut self, point: Point) {
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        self.sel_start = Some(point);
+        self.sel_end = Some(point);
     }
 
     /// 拖拽时更新选区终点。
     pub fn update_selection(&mut self, point: Point) {
-        if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(point, Side::Right);
+        if self.sel_start.is_some() {
+            self.sel_end = Some(point);
         }
     }
 
     /// 清掉选区。
     pub fn clear_selection(&mut self) {
-        self.term.selection = None;
+        self.sel_start = None;
+        self.sel_end = None;
     }
 
     pub fn has_selection(&self) -> bool {
@@ -282,6 +343,43 @@ mod tests {
             Event::PtyWrite(text) => assert_eq!(text, "\x1b[1;1R"),
             other => panic!("期望 PtyWrite，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn selection_keeps_the_first_cell_when_dragging_backwards() {
+        // 用户实测缺陷：从右往左拖，复制结果少了第一个字符（"S C:\..." 而不是 "PS C:\..."）。
+        let mut term = terminal(20, 4);
+        term.feed(b"PS C:\\Users");
+        term.start_selection(Point::new(Line(0), Column(10)));
+        term.update_selection(Point::new(Line(0), Column(0)));
+        assert_eq!(term.selection_text().as_deref(), Some("PS C:\\Users"));
+    }
+
+    #[test]
+    fn selection_trims_trailing_spaces_but_not_leading_ones() {
+        let mut term = terminal(20, 4);
+        term.feed(b"  hi  ");
+        term.start_selection(Point::new(Line(0), Column(0)));
+        term.update_selection(Point::new(Line(0), Column(5)));
+        assert_eq!(term.selection_text().as_deref(), Some("  hi"));
+    }
+
+    #[test]
+    fn selection_spans_lines_with_newlines() {
+        let mut term = terminal(20, 4);
+        term.feed(b"one\r\ntwo");
+        term.start_selection(Point::new(Line(0), Column(1)));
+        term.update_selection(Point::new(Line(1), Column(2)));
+        assert_eq!(term.selection_text().as_deref(), Some("ne\ntwo"));
+    }
+
+    #[test]
+    fn selection_skips_wide_char_spacers() {
+        let mut term = terminal(20, 4);
+        term.feed("中文".as_bytes());
+        term.start_selection(Point::new(Line(0), Column(0)));
+        term.update_selection(Point::new(Line(0), Column(3)));
+        assert_eq!(term.selection_text().as_deref(), Some("中文"));
     }
 
     #[test]

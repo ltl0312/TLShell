@@ -36,10 +36,38 @@ pub enum TabHit {
     Close(usize),
     /// 新建标签。
     New,
+    /// 切换当前标签的 shell 类型（pwsh / powershell / cmd）。
+    Shell,
     /// 清空当前标签的屏幕与滚动缓冲。
     Clear,
     /// 落在标签栏上但没有可点的东西。
     Blank,
+}
+
+/// 标签之间的空隙（像素）。
+pub const TAB_GAP: i32 = 4;
+/// 标签文字的左边距。
+pub const TAB_PAD_LEFT: i32 = 8;
+/// 叉号占位宽度：标题区必须给它让出这么多，否则最后一个字会和 × 叠在一起。
+pub const TAB_CLOSE_W: i32 = 18;
+
+/// 标签栏一次算好的全部几何。
+///
+/// 为什么「一次算完」：标签位置、按钮位置、标签可绘制右界三者互相约束
+/// （标签不许画到按钮上）。拆成几个各算一遍的函数，就会出现三处彼此不一致——
+/// 用户实测的「导航栏排布错乱」正是这么来的：标题宽度没给叉号留位，
+/// 标题最后一个字和 × 直接压在一起。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabBar {
+    pub slots: Vec<TabSlot>,
+    /// 「+」新建按钮的中心。
+    pub new_center: i32,
+    /// 「清屏」按钮的中心。
+    pub clear_center: i32,
+    /// shell 类型按钮的中心（显示 pwsh / ps5 / cmd，点了切换）。
+    pub shell_center: i32,
+    /// 标签可绘制、可命中的右界：再往右就是按钮区。
+    pub clip_end: i32,
 }
 
 /// 标签栏高度：一行字高加上下各 3px 的呼吸空间。
@@ -47,61 +75,79 @@ pub fn tab_bar_height(cell_h: i32) -> i32 {
     cell_h.max(1) + 6
 }
 
-/// 按标签标题算出每个标签的可点范围。
-///
-/// 终端字体是等宽的，所以标题宽度就是「字符数 × 单元格宽」，不需要测量文本。
-pub fn tab_slots(cell_w: i32, titles: &[&str]) -> Vec<TabSlot> {
+/// 单个标签的宽度：左边距 + 标题 + 叉号占位 + 右边距。
+pub fn tab_width(cell_w: i32, title: &str) -> i32 {
     let cell_w = cell_w.max(1);
+    TAB_PAD_LEFT + title.chars().count() as i32 * cell_w + TAB_CLOSE_W + 6
+}
+
+/// 算出整条标签栏的几何。
+///
+/// 按钮从右往左排：清屏 → shell 类型 → 新建。右对齐的好处是标签再多也不会把按钮挤走，
+/// 也不会出现「按钮跟着最后一个标签跑，标签一多就被挤出窗口」。
+pub fn tab_bar(cell_w: i32, titles: &[&str], client_w: i32) -> TabBar {
+    let cell_w = cell_w.max(1);
+    let client_w = client_w.max(1);
+
+    let margin = 10;
+    let clear_w = cell_w * 2;
+    let clear_center = (client_w - margin - cell_w).max(0);
+    let clear_left = client_w - margin - clear_w;
+    let shell_w = cell_w * 4;
+    let shell_center = (clear_left - 12 - shell_w / 2).max(0);
+    let shell_left = clear_left - 12 - shell_w;
+    let new_center = (shell_left - 14).max(0);
+    let clip_end = (new_center - 12).max(0);
+
     let mut slots = Vec::with_capacity(titles.len());
     let mut cursor = 4;
     for title in titles {
-        let width = title.chars().count() as i32 * cell_w + 16;
+        let width = tab_width(cell_w, title);
+        if cursor + width > clip_end {
+            // 放不下就不再往后排：宁可不显示，也不让标签压到按钮上。
+            break;
+        }
         slots.push(TabSlot {
             start: cursor,
             end: cursor + width,
-            close_center: cursor + width - 8,
+            close_center: cursor + width - 6 - TAB_CLOSE_W / 2,
         });
-        cursor += width + 2;
+        cursor += width + TAB_GAP;
     }
-    slots
-}
 
-/// 新建按钮的 x 中心：紧跟最后一个标签之后。
-pub fn new_button_center(cell_w: i32, titles: &[&str]) -> i32 {
-    let slots = tab_slots(cell_w, titles);
-    slots.last().map_or(12, |slot| slot.end + 10)
-}
-
-/// 清屏按钮的 x 中心：在「+」之后再空两个单元格。
-///
-/// 用文字「清屏」而不是图标：字形缓存已经覆盖 CJK，画字符比自造图标稳。
-pub fn clear_button_center(cell_w: i32, titles: &[&str]) -> i32 {
-    new_button_center(cell_w, titles) + cell_w.max(1) * 2 + 10
+    TabBar {
+        slots,
+        new_center,
+        clear_center,
+        shell_center,
+        clip_end,
+    }
 }
 
 /// 标签栏上的 x 坐标落在哪一格。
 ///
-/// 叉号判定优先于标签体：叉号在标签体内部，先判叉号用户才不会「想关却切过去」。
-pub fn hit_tab_bar(cell_w: i32, titles: &[&str], x: i32) -> TabHit {
+/// 判据是「离谁更近」而不是按顺序比区间：叉号在标签体内部，
+/// 两个按钮的半径也会重叠，按顺序判必然有一方被吞掉。
+pub fn hit_tab_bar(bar: &TabBar, cell_w: i32, x: i32) -> TabHit {
     let cell_w = cell_w.max(1);
-    for (index, slot) in tab_slots(cell_w, titles).iter().enumerate() {
-        if (x - slot.close_center).abs() <= 6 {
+    for (index, slot) in bar.slots.iter().enumerate() {
+        if (x - slot.close_center).abs() <= TAB_CLOSE_W / 2 {
             return TabHit::Close(index);
         }
         if x >= slot.start && x < slot.end {
             return TabHit::Select(index);
         }
     }
-    // 判据必须是"离谁更近"，不能是两张互相重叠的区间：
-    // 清屏的 ±(2 格+4) 半径很大，直接按顺序判会把「+」整个吞掉。
-    let new_center = new_button_center(cell_w, titles);
-    let clear_center = clear_button_center(cell_w, titles);
-    let to_new = (x - new_center).abs();
-    let to_clear = (x - clear_center).abs();
-    if to_new <= 8 && to_new <= to_clear {
+    let to_new = (x - bar.new_center).abs();
+    let to_shell = (x - bar.shell_center).abs();
+    let to_clear = (x - bar.clear_center).abs();
+    if to_new <= 10 && to_new <= to_shell && to_new <= to_clear {
         return TabHit::New;
     }
-    if to_clear <= cell_w * 2 + 4 {
+    if to_shell <= cell_w * 2 && to_shell <= to_clear {
+        return TabHit::Shell;
+    }
+    if to_clear <= cell_w + 4 {
         return TabHit::Clear;
     }
     TabHit::Blank
@@ -272,55 +318,85 @@ mod tests {
     }
 
     #[test]
-    fn tab_slots_grow_left_to_right_without_overlap() {
-        let slots = super::tab_slots(8, &["shell", "pwsh-long"]);
-        assert_eq!(slots.len(), 2);
-        assert!(slots[0].start < slots[0].end);
-        assert!(slots[0].end < slots[1].start);
+    fn tabs_never_overlap_and_leave_room_for_the_close_button() {
+        let bar = super::tab_bar(8, &["shell", "pwsh-long"], 900);
+        assert_eq!(bar.slots.len(), 2);
+        assert!(bar.slots[0].start < bar.slots[0].end);
+        assert!(bar.slots[0].end + super::TAB_GAP <= bar.slots[1].start);
         // 更长的标题更宽。
-        assert!(slots[1].end - slots[1].start > slots[0].end - slots[0].start);
+        let first = bar.slots[0].end - bar.slots[0].start;
+        let second = bar.slots[1].end - bar.slots[1].start;
+        assert!(second > first);
+        // 关键回归：标题区必须给叉号留出整块位置，否则最后一个字会压到 × 上
+        // （用户看到的「导航栏排布错乱」就是这个）。
+        for (slot, title) in bar.slots.iter().zip(["shell", "pwsh-long"]) {
+            let room = (slot.end - slot.start) - super::TAB_PAD_LEFT - super::TAB_CLOSE_W - 6;
+            assert!(room >= title.chars().count() as i32 * 8);
+            assert!(slot.close_center + super::TAB_CLOSE_W / 2 <= slot.end);
+        }
     }
 
     #[test]
     fn close_wins_over_select_inside_the_same_tab() {
-        let titles = ["shell"];
-        let slots = super::tab_slots(8, &titles);
+        let bar = super::tab_bar(8, &["shell"], 900);
         assert_eq!(
-            super::hit_tab_bar(8, &titles, slots[0].close_center),
+            super::hit_tab_bar(&bar, 8, bar.slots[0].close_center),
             super::TabHit::Close(0)
         );
         // 标签体左侧离叉号够远，应当切换而不是关闭。
         assert_eq!(
-            super::hit_tab_bar(8, &titles, slots[0].start + 1),
+            super::hit_tab_bar(&bar, 8, bar.slots[0].start + 1),
             super::TabHit::Select(0)
         );
     }
 
     #[test]
-    fn new_button_sits_after_the_last_tab() {
-        let titles = ["a", "b"];
-        let center = super::new_button_center(8, &titles);
-        assert_eq!(super::hit_tab_bar(8, &titles, center), super::TabHit::New);
-        // 空标签栏时也留一个可点的「+」。
-        assert_eq!(super::hit_tab_bar(8, &[], 12), super::TabHit::New);
+    fn buttons_are_right_aligned_and_out_of_the_tab_strip() {
+        let titles = ["shell 1", "shell 2", "shell 3"];
+        let bar = super::tab_bar(8, &titles, 900);
+        // 三个按钮从右往左排：清屏 > shell > 新建。
+        assert!(bar.clear_center > bar.shell_center);
+        assert!(bar.shell_center > bar.new_center);
+        assert!(bar.slots.iter().all(|slot| slot.end <= bar.clip_end));
+        assert_eq!(
+            super::hit_tab_bar(&bar, 8, bar.new_center),
+            super::TabHit::New
+        );
+        assert_eq!(
+            super::hit_tab_bar(&bar, 8, bar.shell_center),
+            super::TabHit::Shell
+        );
+        assert_eq!(
+            super::hit_tab_bar(&bar, 8, bar.clear_center),
+            super::TabHit::Clear
+        );
     }
 
     #[test]
-    fn blank_area_of_the_bar_is_neither_tab_nor_new() {
-        let titles = ["shell"];
-        // 越过「+」和「清屏」之后才是真正的空白。
-        let far = super::clear_button_center(8, &titles) + 60;
-        assert_eq!(super::hit_tab_bar(8, &titles, far), super::TabHit::Blank);
+    fn tabs_are_dropped_instead_of_covering_the_buttons() {
+        // 窗口很窄时宁可不画标签，也不能让标签压到按钮上。
+        let titles = ["shell 1", "shell 2", "shell 3", "shell 4"];
+        let bar = super::tab_bar(8, &titles, 240);
+        assert!(bar.slots.len() < titles.len());
+        assert!(bar.slots.iter().all(|slot| slot.end <= bar.clip_end));
     }
 
     #[test]
-    fn clear_button_sits_after_the_new_button() {
-        let titles = ["shell"];
-        let plus = super::new_button_center(8, &titles);
-        let clear = super::clear_button_center(8, &titles);
-        assert!(clear > plus + 8);
-        assert_eq!(super::hit_tab_bar(8, &titles, clear), super::TabHit::Clear);
-        // 两个按钮挨着的边界不能互相吞掉。
-        assert_eq!(super::hit_tab_bar(8, &titles, plus), super::TabHit::New);
+    fn blank_area_of_the_bar_is_neither_tab_nor_button() {
+        let bar = super::tab_bar(8, &["shell"], 900);
+        assert_eq!(super::hit_tab_bar(&bar, 8, 600), super::TabHit::Blank);
+        // 空标签栏也留一个可点的「+」。
+        let empty = super::tab_bar(8, &[], 900);
+        assert_eq!(
+            super::hit_tab_bar(&empty, 8, empty.new_center),
+            super::TabHit::New
+        );
+    }
+
+    #[test]
+    fn shell_button_sits_between_new_and_clear() {
+        let bar = super::tab_bar(8, &["shell"], 900);
+        assert!(bar.shell_center > bar.new_center + 8);
+        assert!(bar.shell_center < bar.clear_center - 8);
     }
 }

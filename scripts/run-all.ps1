@@ -505,7 +505,8 @@ function Invoke-LayerD {
     $tabsFailed = @($tabs | Where-Object { $_ -match '^\[FAIL\]' }).Count
     $tabsPassed = @($tabs | Where-Object { $_ -match '^\[PASS\]' }).Count
     $tabsDetail = @($tabs | Where-Object { $_ -match 'FAIL' }) -join ' | '
-    Add-Result D '标签栏按钮可点' $(if ($tabsFailed -eq 0 -and $tabsPassed -ge 6) { 'PASS' } else { 'FAIL' }) "通过 $tabsPassed 项，失败 $tabsFailed 项 $tabsDetail"
+    # 9 项：新建 / 切换 / 清屏 / 关闭 / 序号复用 / 关到空补一个 / 悬停反馈 / shell 切换 / 滚轮回滚
+    Add-Result D '标签栏与回滚可用' $(if ($tabsFailed -eq 0 -and $tabsPassed -ge 9) { 'PASS' } else { 'FAIL' }) "通过 $tabsPassed 项，失败 $tabsFailed 项 $tabsDetail"
 
     # 自启动开关：注册表能读写并读回。
     $autoStatus = Invoke-Capture $exe @('--autostart', 'status')
